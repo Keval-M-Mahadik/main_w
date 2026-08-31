@@ -33,7 +33,7 @@ from urllib.parse import quote_plus
 # USER_BOT_TOKEN=your_new_bot_token
 #
 # Do NOT hard-code your Telegram bot token.
-USER_BOT_TOKEN = os.getenv("USER_BOT_TOKEN", "8771414496:AAFBw-cGZhExTMbkZcvecolcDxAV9nzpjt8").strip()
+USER_BOT_TOKEN = os.getenv("USER_BOT_TOKEN", "8771414496:AAEZYXZa3TXHPcJoEYxHmI105c60F8VSYxo").strip()
 
 GROUP_URL = "https://t.me/Dark911_osint"
 CHANNEL_URL = "https://t.me/Cyber_Warriors_22"

@@ -5,6 +5,7 @@ import json
 import time
 import threading
 import traceback
+import zipfile
 
 from io import BytesIO
 from urllib.parse import quote_plus
@@ -159,13 +160,40 @@ def _safe_load(path, default):
 
 
 def _safe_save(path, data):
+    """Write JSON compactly (no whitespace) — smaller file, faster I/O."""
     try:
         tmp = f"{path}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+            json.dump(data, f, separators=(",", ":"), ensure_ascii=False)
         os.replace(tmp, path)
     except Exception as e:
         print(f"⚠️ save {path} failed: {e}")
+
+
+# ============================================================
+# 5a. AUTO-CREATE JSON FILES (only if missing)
+# ============================================================
+_JSON_DEFAULTS = {
+    ADMINS_FILE:    [],
+    PASSWORD_FILE:  None,
+    BANNED_FILE:    {},
+    NOTES_FILE:     {},
+    ADMIN_LOG_FILE: [],
+    LASTSEEN_FILE:  {},
+    LANGS_FILE:     {},
+}
+
+
+def ensure_json_files():
+    """Create every JSON file with a sensible default if it doesn't exist."""
+    for path, default in _JSON_DEFAULTS.items():
+        if os.path.exists(path):
+            continue
+        if path == PASSWORD_FILE:
+            _safe_save(path, {"password": ADMIN_PASSWORD})
+        else:
+            _safe_save(path, default)
+        print(f"🆕 Created {path}")
 
 
 def load_password():
@@ -254,6 +282,115 @@ def log_admin(by, action, target=""):
     if len(ADMIN_LOG) > ADMIN_LOG_MAX:
         del ADMIN_LOG[:-ADMIN_LOG_MAX]
     save_log()
+
+
+# ============================================================
+# 5b. OWNER JSON FILE MANAGER  (owner-only viewer + downloader)
+# ============================================================
+JSON_FILE_MAP = {
+    "admins.json":         ADMINS_FILE,
+    "admin_password.json": PASSWORD_FILE,
+    "banned.json":         BANNED_FILE,
+    "user_notes.json":     NOTES_FILE,
+    "admin_log.json":      ADMIN_LOG_FILE,
+    "last_seen.json":      LASTSEEN_FILE,
+    "user_langs.json":     LANGS_FILE,
+}
+
+
+def owner_files_keyboard():
+    rows = []
+    for fname in JSON_FILE_MAP:
+        rows.append([
+            {"text": f"👁 View {fname}", "callback_data": f"owner:view:{fname}"},
+            {"text": "📥",               "callback_data": f"owner:download:{fname}"},
+        ])
+    rows.append([{"text": "📦 Download All (ZIP)", "callback_data": "owner:download_all"}])
+    rows.append([{"text": "🔙 Back",               "callback_data": "owner:back"}])
+    return {"inline_keyboard": rows}
+
+
+def _escape_html(s: str) -> str:
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _owner_send_file_content(bot_number, chat_id, fname):
+    path = JSON_FILE_MAP.get(fname)
+    if not path:
+        admin_send_message(bot_number, chat_id, "❌ Unknown file.",
+                           owner_files_keyboard())
+        return
+    if not os.path.exists(path):
+        admin_send_message(bot_number, chat_id,
+                           f"❌ File not found: <code>{fname}</code>",
+                           owner_files_keyboard())
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = f.read()
+        try:
+            pretty = json.dumps(json.loads(raw), indent=2, ensure_ascii=False)
+        except Exception:
+            pretty = raw
+    except Exception as e:
+        admin_send_message(bot_number, chat_id, f"❌ Read failed: {e}",
+                           owner_files_keyboard())
+        return
+
+    header = f"📄 <b>{fname}</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    body = _escape_html(pretty)
+    chunk = 3500
+    if len(body) <= chunk:
+        admin_send_message(bot_number, chat_id,
+                           header + f"<pre>{body}</pre>",
+                           owner_files_keyboard())
+        return
+    admin_send_message(bot_number, chat_id, header + "<i>(truncated preview)</i>")
+    for i in range(0, len(body), chunk):
+        admin_send_message(bot_number, chat_id, f"<pre>{body[i:i + chunk]}</pre>")
+    admin_send_message(bot_number, chat_id, "✅ End of preview.",
+                       owner_files_keyboard())
+
+
+def _owner_download_file(bot_number, chat_id, fname):
+    path = JSON_FILE_MAP.get(fname)
+    if not path or not os.path.exists(path):
+        admin_send_message(bot_number, chat_id,
+                           f"❌ File not found: <code>{fname}</code>",
+                           owner_files_keyboard())
+        return
+    try:
+        url = f"{ADMIN_TG_APIS[bot_number]}/sendDocument"
+        with open(path, "rb") as f:
+            ADMIN_HTTP.post(url,
+                            data={"chat_id": chat_id,
+                                  "caption": f"📥 <b>{fname}</b>",
+                                  "parse_mode": "HTML"},
+                            files={"document": (fname, f, "application/json")},
+                            timeout=(10, 60))
+    except Exception as e:
+        admin_send_message(bot_number, chat_id, f"❌ Download failed: {e}",
+                           owner_files_keyboard())
+
+
+def _owner_download_all(bot_number, chat_id):
+    try:
+        tmp_path = "/tmp/all_data.zip"
+        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for fname, path in JSON_FILE_MAP.items():
+                if os.path.exists(path):
+                    zf.write(path, arcname=fname)
+        url = f"{ADMIN_TG_APIS[bot_number]}/sendDocument"
+        with open(tmp_path, "rb") as f:
+            ADMIN_HTTP.post(url,
+                            data={"chat_id": chat_id,
+                                  "caption": "📦 <b>All data files</b>",
+                                  "parse_mode": "HTML"},
+                            files={"document": ("all_data.zip", f, "application/zip")},
+                            timeout=(10, 60))
+    except Exception as e:
+        admin_send_message(bot_number, chat_id, f"❌ ZIP failed: {e}",
+                           owner_files_keyboard())
 
 
 # ============================================================
@@ -385,16 +522,15 @@ _LANG_ALIASES = {
 }
 
 
-# ---- Core TEXTS (top 10 languages get full translations) ----
 TEXTS = {
     "en": {
         "welcome": ("✨ <b>W E L C O M E</b> ✨\n"
                     "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    "🤖 <b>Free OSINT Bot</b>\n🔓 All intelligence tools unlocked\n"
+                    "🤖 <b>Free OSINT Bot</b>\n📓 All intelligence tools unlocked\n"
                     "⚡ Fast  •  🔒 Secure  •  🎯 Reliable\n\n"
                     "💬 <b>Support:</b> @Tony_M_unlock"),
         "select_feature": ("🛠 <b>M A I N   M E N U</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                           "👇 <b>Select a feature to begin:</b>\n\n"
+                           "👮 <b>Select a feature to begin:</b>\n\n"
                            "💬 <b>Support:</b> @Tony_M_unlock"),
         "support": "💬 <b>Support:</b> @Tony_M_unlock",
         "cancelled": "❌ <b>Cancelled.</b>",
@@ -417,10 +553,11 @@ TEXTS = {
                           "💬 <b>Support:</b> @Tony_M_unlock"),
         "join_ok": "✅ Memberships verified. Welcome!",
         "join_fail": "❌ You must join both the channel and group first.",
-        "maintenance": ("🛠 <b>UNDER MAINTENANCE</b>\n"
+        "maintenance": ("🛠 <b>U N D E R   M A I N T E N A N C E</b>\n"
                         "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                        "The bot is temporarily unavailable.\n"
-                        "Please try again later.\n\n"
+                        "⚠️ The bot is temporarily <b>offline</b>\n"
+                        "for scheduled maintenance.\n\n"
+                        "🕒 Please try again in a little while.\n\n"
                         "💬 <b>Support:</b> @Tony_M_unlock"),
         "banned_msg": ("🚫 <b>ACCESS BLOCKED</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                        "Your account has been suspended."),
@@ -428,11 +565,11 @@ TEXTS = {
     },
     "hi": {
         "welcome": ("✨ <b>स्वागत है</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    "🤖 <b>फ्री OSINT बॉट</b>\n🔓 सभी इंटेलिजेंस टूल्स अनलॉक\n"
+                    "🤖 <b>फ्री OSINT बॉट</b>\n📓 सभी इंटेलिजेंस टूल्स अनलॉक\n"
                     "⚡ तेज़  •  🔒 सुरक्षित  •  🎯 विश्वसनीय\n\n"
                     "💬 <b>सपोर्ट:</b> @Tony_M_unlock"),
         "select_feature": ("🛠 <b>मुख्य मेनू</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                           "👇 <b>शुरू करने के लिए एक सुविधा चुनें:</b>\n\n"
+                           "👮 <b>शुरू करने के लिए एक सुविधा चुनें:</b>\n\n"
                            "💬 <b>सपोर्ट:</b> @Tony_M_unlock"),
         "support": "💬 <b>सपोर्ट:</b> @Tony_M_unlock",
         "cancelled": "❌ <b>रद्द किया गया।</b>",
@@ -454,18 +591,21 @@ TEXTS = {
         "join_ok": "✅ सदस्यता सत्यापित। स्वागत है!",
         "join_fail": "❌ पहले चैनल और ग्रुप दोनों जॉइन करें।",
         "maintenance": ("🛠 <b>रखरखाव जारी</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                        "बॉट अस्थायी रूप से अनुपलब्ध है।\nकृपया बाद में प्रयास करें।"),
+                        "⚠️ बॉट अनुसूचित रखरखाव के लिए\n"
+                        "अस्थायी रूप से <b>ऑफ़लाइन</b> है।\n\n"
+                        "🕒 कृपया थोड़ी देर बाद पुनः प्रयास करें।\n\n"
+                        "💬 <b>सपोर्ट:</b> @Tony_M_unlock"),
         "banned_msg": ("🚫 <b>पहुंच अवरुद्ध</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                        "आपका खाता निलंबित कर दिया गया है।"),
         "current_lang": "🌐 वर्तमान भाषा: <b>{name}</b>",
     },
     "bn": {
         "welcome": ("✨ <b>স্বাগতম</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    "🤖 <b>ফ্রি OSINT বট</b>\n🔓 সমস্ত ইন্টেলিজেন্স টুল আনলক\n"
+                    "🤖 <b>ফ্রি OSINT বট</b>\n📓 সমস্ত ইন্টেলিজেন্স টুল আনলক\n"
                     "⚡ দ্রুত  •  🔒 নিরাপদ  •  🎯 নির্ভরযোগ্য\n\n"
                     "💬 <b>সাপোর্ট:</b> @Tony_M_unlock"),
         "select_feature": ("🛠 <b>প্রধান মেনু</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                           "👇 <b>শুরু করতে একটি ফিচার নির্বাচন করুন:</b>\n\n"
+                           "👮 <b>শুরু করতে একটি ফিচার নির্বাচন করুন:</b>\n\n"
                            "💬 <b>সাপোর্ট:</b> @Tony_M_unlock"),
         "support": "💬 <b>সাপোর্ট:</b> @Tony_M_unlock",
         "cancelled": "❌ <b>বাতিল হয়েছে।</b>",
@@ -481,24 +621,27 @@ TEXTS = {
         "support_btn": "💬 সাপোর্ট",
         "continue_btn": "✅ চালিয়ে যান",
         "join_required": ("🔒 <b>সদস্যপদ প্রয়োজন</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                          "এই বট ব্যবহার করতে আমাদের <b>চ্যানেল</b> ও <b>গ্রুপে</b> "
-                          "যোগ দিতে হবে।\n\nযোগ দেওয়ার পর <b>✅ চালিয়ে যান</b> চাপুন।\n\n"
+                          "এই বট ব্যবহার করতে চ্যানেল ও গ্রুপ জয়েন করুন।\n\n"
+                          "এরপর <b>✅ চালিয়ে যান</b> চাপুন।\n\n"
                           "💬 <b>সাপোর্ট:</b> @Tony_M_unlock"),
         "join_ok": "✅ সদস্যপদ যাচাই হয়েছে। স্বাগতম!",
-        "join_fail": "❌ প্রথমে চ্যানেল ও গ্রুপ উভয়ে যোগ দিন।",
+        "join_fail": "❌ প্রথমে চ্যানেল ও গ্রুপ উভয়েই জয়েন করুন।",
         "maintenance": ("🛠 <b>রক্ষণাবেক্ষণ চলছে</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                        "বট সাময়িকভাবে অনুপলব্ধ।\nপরে আবার চেষ্টা করুন।"),
+                        "⚠️ বট নির্ধারিত রক্ষণাবেক্ষণের জন্য\n"
+                        "সাময়িকভাবে <b>অফলাইন</b>।\n\n"
+                        "🕒 অনুগ্রহ করে কিছুক্ষণ পরে আবার চেষ্টা করুন।\n\n"
+                        "💬 <b>সাপোর্ট:</b> @Tony_M_unlock"),
         "banned_msg": ("🚫 <b>প্রবেশ অবরুদ্ধ</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                        "আপনার অ্যাকাউন্ট স্থগিত করা হয়েছে।"),
         "current_lang": "🌐 বর্তমান ভাষা: <b>{name}</b>",
     },
     "ur": {
         "welcome": ("✨ <b>خوش آمدید</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    "🤖 <b>مفت OSINT بوٹ</b>\n🔓 تمام انٹیلیجنس ٹولز غیر مقفل\n"
+                    "🤖 <b>مفت OSINT بوٹ</b>\n📓 تمام انٹیلیجنس ٹولز غیر مقفل\n"
                     "⚡ تیز  •  🔒 محفوظ  •  🎯 قابل اعتماد\n\n"
                     "💬 <b>سپورٹ:</b> @Tony_M_unlock"),
         "select_feature": ("🛠 <b>مرکزی مینو</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                           "👇 <b>شروع کرنے کے لیے ایک فیچر منتخب کریں:</b>\n\n"
+                           "👮 <b>شروع کرنے کے لیے ایک فیچر منتخب کریں:</b>\n\n"
                            "💬 <b>سپورٹ:</b> @Tony_M_unlock"),
         "support": "💬 <b>سپورٹ:</b> @Tony_M_unlock",
         "cancelled": "❌ <b>منسوخ کر دیا گیا۔</b>",
@@ -514,24 +657,27 @@ TEXTS = {
         "support_btn": "💬 سپورٹ",
         "continue_btn": "✅ جاری رکھیں",
         "join_required": ("🔒 <b>رکنیت درکار ہے</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                          "اس بوٹ کو استعمال کرنے کے لیے <b>چینل</b> اور <b>گروپ</b> "
-                          "جوائن کرنا ضروری ہے۔\n\nجوائن کے بعد <b>✅ جاری رکھیں</b> پر ٹیپ کریں۔\n\n"
+                          "اس بوٹ کو استعمال کرنے کے لیے چینل اور گروپ جوائن کریں۔\n\n"
+                          "جوائن کے بعد <b>✅ جاری رکھیں</b> پر ٹیپ کریں۔\n\n"
                           "💬 <b>سپورٹ:</b> @Tony_M_unlock"),
         "join_ok": "✅ رکنیت کی تصدیق ہو گئی۔ خوش آمدید!",
         "join_fail": "❌ پہلے چینل اور گروپ دونوں جوائن کریں۔",
         "maintenance": ("🛠 <b>دیکھ بھال جاری ہے</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                        "بوٹ عارضی طور پر دستیاب نہیں ہے۔\nبعد میں دوبارہ کوشش کریں۔"),
+                        "⚠️ بوٹ مقررہ دیکھ بھال کے لیے\n"
+                        "عارضی طور پر <b>آف لائن</b> ہے۔\n\n"
+                        "🕒 براہ کرم تھوڑی دیر بعد دوبارہ کوشش کریں۔\n\n"
+                        "💬 <b>سپورٹ:</b> @Tony_M_unlock"),
         "banned_msg": ("🚫 <b>رسائی بلاک</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                        "آپ کا اکاؤنٹ معطل کر دیا گیا ہے۔"),
         "current_lang": "🌐 موجودہ زبان: <b>{name}</b>",
     },
     "ar": {
         "welcome": ("✨ <b>مرحباً</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    "🤖 <b>بوت OSINT مجاني</b>\n🔓 جميع أدوات الاستخبارات مفتوحة\n"
+                    "🤖 <b>بوت OSINT مجاني</b>\n📓 جميع أدوات الاستخبارات مفتوحة\n"
                     "⚡ سريع  •  🔒 آمن  •  🎯 موثوق\n\n"
                     "💬 <b>الدعم:</b> @Tony_M_unlock"),
         "select_feature": ("🛠 <b>القائمة الرئيسية</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                           "👇 <b>اختر ميزة للبدء:</b>\n\n💬 <b>الدعم:</b> @Tony_M_unlock"),
+                           "👮 <b>اختر ميزة للبدء:</b>\n\n💬 <b>الدعم:</b> @Tony_M_unlock"),
         "support": "💬 <b>الدعم:</b> @Tony_M_unlock",
         "cancelled": "❌ <b>تم الإلغاء.</b>",
         "choose_language": "🌐 <b>الرجاء اختيار لغتك:</b>",
@@ -546,24 +692,27 @@ TEXTS = {
         "support_btn": "💬 الدعم",
         "continue_btn": "✅ متابعة",
         "join_required": ("🔒 <b>العضوية مطلوبة</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                          "يجب الانضمام إلى <b>القناة</b> و<b>المجموعة</b> لاستخدام هذا البوت.\n\n"
+                          "يجب الانضمام إلى القناة والمجموعة لاستخدام هذا البوت.\n\n"
                           "بعد الانضمام اضغط <b>✅ متابعة</b>.\n\n"
                           "💬 <b>الدعم:</b> @Tony_M_unlock"),
         "join_ok": "✅ تم التحقق من العضوية. مرحباً!",
         "join_fail": "❌ يجب الانضمام إلى القناة والمجموعة أولاً.",
         "maintenance": ("🛠 <b>تحت الصيانة</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                        "البوت غير متاح مؤقتاً.\nيرجى المحاولة لاحقاً."),
+                        "⚠️ البوت <b>غير متصل</b> مؤقتاً\n"
+                        "لأعمال صيانة مجدولة.\n\n"
+                        "🕒 يرجى المحاولة مرة أخرى بعد قليل.\n\n"
+                        "💬 <b>الدعم:</b> @Tony_M_unlock"),
         "banned_msg": ("🚫 <b>تم حظر الوصول</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                        "تم تعليق حسابك."),
         "current_lang": "🌐 اللغة الحالية: <b>{name}</b>",
     },
     "es": {
         "welcome": ("✨ <b>B I E N V E N I D O</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    "🤖 <b>Bot OSINT Gratuito</b>\n🔓 Todas las herramientas desbloqueadas\n"
+                    "🤖 <b>Bot OSINT Gratuito</b>\n📓 Todas las herramientas desbloqueadas\n"
                     "⚡ Rápido  •  🔒 Seguro  •  🎯 Confiable\n\n"
                     "💬 <b>Soporte:</b> @Tony_M_unlock"),
         "select_feature": ("🛠 <b>M E N Ú   P R I N C I P A L</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                           "👇 <b>Selecciona una función:</b>\n\n💬 <b>Soporte:</b> @Tony_M_unlock"),
+                           "👮 <b>Selecciona una función:</b>\n\n💬 <b>Soporte:</b> @Tony_M_unlock"),
         "support": "💬 <b>Soporte:</b> @Tony_M_unlock",
         "cancelled": "❌ <b>Cancelado.</b>",
         "choose_language": "🌐 <b>Por favor elige tu idioma:</b>",
@@ -578,24 +727,27 @@ TEXTS = {
         "support_btn": "💬 Soporte",
         "continue_btn": "✅ Continuar",
         "join_required": ("🔒 <b>SE REQUIERE MEMBRESÍA</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                          "Debes unirte a nuestro <b>canal</b> y <b>grupo</b> para usar este bot.\n\n"
+                          "Debes unirte a nuestro canal y grupo para usar este bot.\n\n"
                           "Después pulsa <b>✅ Continuar</b>.\n\n"
                           "💬 <b>Soporte:</b> @Tony_M_unlock"),
         "join_ok": "✅ Membresías verificadas. ¡Bienvenido!",
         "join_fail": "❌ Primero debes unirte al canal y al grupo.",
-        "maintenance": ("🛠 <b>EN MANTENIMIENTO</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                        "El bot no está disponible temporalmente.\nInténtalo más tarde."),
+        "maintenance": ("🛠 <b>E N   M A N T E N I M I E N T O</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                        "⚠️ El bot está <b>fuera de línea</b> temporalmente\n"
+                        "por mantenimiento programado.\n\n"
+                        "🕒 Inténtalo de nuevo en un momento.\n\n"
+                        "💬 <b>Soporte:</b> @Tony_M_unlock"),
         "banned_msg": ("🚫 <b>ACCESO BLOQUEADO</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                        "Tu cuenta ha sido suspendida."),
         "current_lang": "🌐 Idioma actual: <b>{name}</b>",
     },
     "fr": {
         "welcome": ("✨ <b>B I E N V E N U E</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    "🤖 <b>Bot OSINT Gratuit</b>\n🔓 Tous les outils débloqués\n"
+                    "🤖 <b>Bot OSINT Gratuit</b>\n📓 Tous les outils débloqués\n"
                     "⚡ Rapide  •  🔒 Sécurisé  •  🎯 Fiable\n\n"
                     "💬 <b>Support:</b> @Tony_M_unlock"),
         "select_feature": ("🛠 <b>M E N U   P R I N C I P A L</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                           "👇 <b>Sélectionnez une fonctionnalité:</b>\n\n💬 <b>Support:</b> @Tony_M_unlock"),
+                           "👮 <b>Sélectionnez une fonctionnalité:</b>\n\n💬 <b>Support:</b> @Tony_M_unlock"),
         "support": "💬 <b>Support:</b> @Tony_M_unlock",
         "cancelled": "❌ <b>Annulé.</b>",
         "choose_language": "🌐 <b>Veuillez choisir votre langue:</b>",
@@ -610,24 +762,27 @@ TEXTS = {
         "support_btn": "💬 Support",
         "continue_btn": "✅ Continuer",
         "join_required": ("🔒 <b>ADHÉSION REQUISE</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                          "Rejoignez notre <b>chaîne</b> et <b>groupe</b> pour utiliser ce bot.\n\n"
+                          "Rejoignez notre chaîne et groupe pour utiliser ce bot.\n\n"
                           "Puis appuyez sur <b>✅ Continuer</b>.\n\n"
                           "💬 <b>Support:</b> @Tony_M_unlock"),
         "join_ok": "✅ Adhésions vérifiées. Bienvenue!",
         "join_fail": "❌ Rejoignez d'abord la chaîne et le groupe.",
-        "maintenance": ("🛠 <b>EN MAINTENANCE</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                        "Le bot est temporairement indisponible.\nRéessayez plus tard."),
+        "maintenance": ("🛠 <b>E N   M A I N T E N A N C E</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                        "⚠️ Le bot est temporairement <b>hors ligne</b>\n"
+                        "pour maintenance programmée.\n\n"
+                        "🕒 Réessayez dans quelques instants.\n\n"
+                        "💬 <b>Support:</b> @Tony_M_unlock"),
         "banned_msg": ("🚫 <b>ACCÈS BLOQUÉ</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                        "Votre compte a été suspendu."),
         "current_lang": "🌐 Langue actuelle: <b>{name}</b>",
     },
     "ru": {
         "welcome": ("✨ <b>Д О Б Р О   П О Ж А Л О В А Т Ь</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    "🤖 <b>Бесплатный OSINT-бот</b>\n🔓 Все инструменты разблокированы\n"
+                    "🤖 <b>Бесплатный OSINT-бот</b>\n📓 Все инструменты разблокированы\n"
                     "⚡ Быстро  •  🔒 Безопасно  •  🎯 Надёжно\n\n"
                     "💬 <b>Поддержка:</b> @Tony_M_unlock"),
         "select_feature": ("🛠 <b>Г Л А В Н О Е   М Е Н Ю</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                           "👇 <b>Выберите функцию:</b>\n\n💬 <b>Поддержка:</b> @Tony_M_unlock"),
+                           "👮 <b>Выберите функцию:</b>\n\n💬 <b>Поддержка:</b> @Tony_M_unlock"),
         "support": "💬 <b>Поддержка:</b> @Tony_M_unlock",
         "cancelled": "❌ <b>Отменено.</b>",
         "choose_language": "🌐 <b>Выберите язык:</b>",
@@ -642,24 +797,28 @@ TEXTS = {
         "support_btn": "💬 Поддержка",
         "continue_btn": "✅ Продолжить",
         "join_required": ("🔒 <b>ТРЕБУЕТСЯ ПОДПИСКА</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                          "Присоединитесь к <b>каналу</b> и <b>группе</b> чтобы использовать бота.\n\n"
+                          "Присоединитесь к каналу и группе чтобы использовать бота.\n\n"
                           "После нажмите <b>✅ Продолжить</b>.\n\n"
                           "💬 <b>Поддержка:</b> @Tony_M_unlock"),
         "join_ok": "✅ Подписки подтверждены. Добро пожаловать!",
         "join_fail": "❌ Сначала присоединитесь к каналу и группе.",
-        "maintenance": ("🛠 <b>ТЕХНИЧЕСКОЕ ОБСЛУЖИВАНИЕ</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                        "Бот временно недоступен.\nПопробуйте позже."),
+        "maintenance": ("🛠 <b>Т Е Х Н И Ч Е С К О Е   О Б С Л У Ж И В А Н И Е</b>\n"
+                        "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                        "⚠️ Бот временно <b>недоступен</b>\n"
+                        "по причине планового обслуживания.\n\n"
+                        "🕒 Попробуйте ещё раз через несколько минут.\n\n"
+                        "💬 <b>Поддержка:</b> @Tony_M_unlock"),
         "banned_msg": ("🚫 <b>ДОСТУП ЗАБЛОКИРОВАН</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                        "Ваш аккаунт заблокирован."),
         "current_lang": "🌐 Текущий язык: <b>{name}</b>",
     },
     "pt": {
         "welcome": ("✨ <b>B E M - V I N D O</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    "🤖 <b>Bot OSINT Gratuito</b>\n🔓 Todas as ferramentas desbloqueadas\n"
+                    "🤖 <b>Bot OSINT Gratuito</b>\n📓 Todas as ferramentas desbloqueadas\n"
                     "⚡ Rápido  •  🔒 Seguro  •  🎯 Confiável\n\n"
                     "💬 <b>Suporte:</b> @Tony_M_unlock"),
         "select_feature": ("🛠 <b>M E N U   P R I N C I P A L</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                           "👇 <b>Selecione um recurso:</b>\n\n💬 <b>Suporte:</b> @Tony_M_unlock"),
+                           "👮 <b>Selecione um recurso:</b>\n\n💬 <b>Suporte:</b> @Tony_M_unlock"),
         "support": "💬 <b>Suporte:</b> @Tony_M_unlock",
         "cancelled": "❌ <b>Cancelado.</b>",
         "choose_language": "🌐 <b>Escolha seu idioma:</b>",
@@ -674,24 +833,27 @@ TEXTS = {
         "support_btn": "💬 Suporte",
         "continue_btn": "✅ Continuar",
         "join_required": ("🔒 <b>MEMBRESIA NECESSÁRIA</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                          "Entre no nosso <b>canal</b> e <b>grupo</b> para usar este bot.\n\n"
+                          "Entre no nosso canal e grupo para usar este bot.\n\n"
                           "Depois toque em <b>✅ Continuar</b>.\n\n"
                           "💬 <b>Suporte:</b> @Tony_M_unlock"),
         "join_ok": "✅ Membresias verificadas. Bem-vindo!",
         "join_fail": "❌ Entre no canal e no grupo primeiro.",
-        "maintenance": ("🛠 <b>EM MANUTENÇÃO</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                        "O bot está temporariamente indisponível.\nTente mais tarde."),
+        "maintenance": ("🛠 <b>E M   M A N U T E N Ç Ã O</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                        "⚠️ O bot está temporariamente <b>offline</b>\n"
+                        "para manutenção programada.\n\n"
+                        "🕒 Tente novamente em alguns instantes.\n\n"
+                        "💬 <b>Suporte:</b> @Tony_M_unlock"),
         "banned_msg": ("🚫 <b>ACESSO BLOQUEADO</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                        "Sua conta foi suspensa."),
         "current_lang": "🌐 Idioma atual: <b>{name}</b>",
     },
     "id": {
         "welcome": ("✨ <b>S E L A M A T   D A T A N G</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    "🤖 <b>Bot OSINT Gratis</b>\n🔓 Semua alat intelijen terbuka\n"
+                    "🤖 <b>Bot OSINT Gratis</b>\n📓 Semua alat intelijen terbuka\n"
                     "⚡ Cepat  •  🔒 Aman  •  🎯 Andal\n\n"
                     "💬 <b>Dukungan:</b> @Tony_M_unlock"),
         "select_feature": ("🛠 <b>M E N U   U T A M A</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                           "👇 <b>Pilih fitur untuk memulai:</b>\n\n💬 <b>Dukungan:</b> @Tony_M_unlock"),
+                           "👮 <b>Pilih fitur untuk memulai:</b>\n\n💬 <b>Dukungan:</b> @Tony_M_unlock"),
         "support": "💬 <b>Dukungan:</b> @Tony_M_unlock",
         "cancelled": "❌ <b>Dibatalkan.</b>",
         "choose_language": "🌐 <b>Silakan pilih bahasa Anda:</b>",
@@ -706,13 +868,16 @@ TEXTS = {
         "support_btn": "💬 Dukungan",
         "continue_btn": "✅ Lanjutkan",
         "join_required": ("🔒 <b>KEANGGOTAAN DIPERLUKAN</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                          "Gabung ke <b>saluran</b> dan <b>grup</b> kami untuk menggunakan bot ini.\n\n"
+                          "Gabung ke saluran dan grup kami untuk menggunakan bot ini.\n\n"
                           "Setelah bergabung, ketuk <b>✅ Lanjutkan</b>.\n\n"
                           "💬 <b>Dukungan:</b> @Tony_M_unlock"),
         "join_ok": "✅ Keanggotaan diverifikasi. Selamat datang!",
         "join_fail": "❌ Anda harus bergabung dengan saluran dan grup dulu.",
-        "maintenance": ("🛠 <b>DALAM PEMELIHARAAN</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                        "Bot sementara tidak tersedia.\nSilakan coba lagi nanti."),
+        "maintenance": ("🛠 <b>D A L A M   P E M E L I H A R A A N</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                        "⚠️ Bot sementara <b>offline</b>\n"
+                        "untuk pemeliharaan terjadwal.\n\n"
+                        "🕒 Silakan coba lagi beberapa saat lagi.\n\n"
+                        "💬 <b>Dukungan:</b> @Tony_M_unlock"),
         "banned_msg": ("🚫 <b>AKSES DIBLOKIR</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                        "Akun Anda telah ditangguhkan."),
         "current_lang": "🌐 Bahasa saat ini: <b>{name}</b>",
@@ -727,11 +892,9 @@ def _register_lang(code, data):
     TEXTS[code] = base
 
 
-# ---- Additional 22 languages (compact — missing keys fall back to English) ----
 _register_lang("de", {
-    "welcome": "✨ <b>W I L L K O M M E N</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>Kostenloser OSINT-Bot</b>\n🔓 Alle Tools freigeschaltet\n⚡ Schnell  •  🔒 Sicher  •  🎯 Zuverlässig\n\n💬 <b>Support:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>H A U P T M E N Ü</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👇 <b>Wählen Sie eine Funktion:</b>",
-    "support": "💬 <b>Support:</b> @Tony_M_unlock",
+    "welcome": "✨ <b>W I L L K O M M E N</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>Kostenloser OSINT-Bot</b>\n📓 Alle Tools freigeschaltet\n⚡ Schnell  •  🔒 Sicher  •  🎯 Zuverlässig\n\n💬 <b>Support:</b> @Tony_M_unlock",
+    "select_feature": "🛠 <b>H A U P T M E N Ü</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>Wählen Sie eine Funktion:</b>",
     "cancelled": "❌ <b>Abgebrochen.</b>",
     "choose_language": "🌐 <b>Bitte wählen Sie Ihre Sprache:</b>",
     "language_set": "✅ Sprache erfolgreich aktualisiert.",
@@ -744,14 +907,13 @@ _register_lang("de", {
     "lang_btn": "🌐 Sprache",
     "support_btn": "💬 Support",
     "continue_btn": "✅ Weiter",
-    "maintenance": "🛠 <b>WARTUNG</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\nDer Bot ist vorübergehend nicht verfügbar.\nBitte später erneut versuchen.",
+    "maintenance": "🛠 <b>W A R T U N G</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ Der Bot ist vorübergehend <b>offline</b> wegen geplanter Wartung.\n\n🕒 Bitte versuchen Sie es in Kürze erneut.\n\n💬 <b>Support:</b> @Tony_M_unlock",
     "banned_msg": "🚫 <b>ZUGANG BLOCKIERT</b>\n\nIhr Konto wurde gesperrt.",
     "current_lang": "🌐 Aktuelle Sprache: <b>{name}</b>",
 })
 _register_lang("zh", {
-    "welcome": "✨ <b>欢 迎</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>免费 OSINT 机器人</b>\n🔓 所有工具已解锁\n⚡ 快速  •  🔒 安全  •  🎯 可靠\n\n💬 <b>支持:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>主 菜 单</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👇 <b>请选择功能:</b>",
-    "support": "💬 <b>支持:</b> @Tony_M_unlock",
+    "welcome": "✨ <b>欢 迎</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>免费 OSINT 机器人</b>\n📓 所有工具已解锁\n⚡ 快速  •  🔒 安全  •  🎯 可靠\n\n💬 <b>支持:</b> @Tony_M_unlock",
+    "select_feature": "🛠 <b>主 菜 单</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>请选择功能:</b>",
     "cancelled": "❌ <b>已取消。</b>",
     "choose_language": "🌐 <b>请选择您的语言:</b>",
     "language_set": "✅ 语言更新成功。",
@@ -764,14 +926,13 @@ _register_lang("zh", {
     "lang_btn": "🌐 语言",
     "support_btn": "💬 支持",
     "continue_btn": "✅ 继续",
-    "maintenance": "🛠 <b>维 护 中</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n机器人暂时不可用。\n请稍后再试。",
+    "maintenance": "🛠 <b>维 护 中</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ 机器人因计划维护暂时<b>离线</b>。\n\n🕒 请稍后重试。\n\n💬 <b>支持:</b> @Tony_M_unlock",
     "banned_msg": "🚫 <b>访问被阻止</b>\n\n您的账户已被暂停。",
     "current_lang": "🌐 当前语言: <b>{name}</b>",
 })
 _register_lang("ja", {
-    "welcome": "✨ <b>よ う こ そ</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>無料 OSINT Bot</b>\n🔓 すべてのツールが解除されました\n⚡ 高速  •  🔒 安全  •  🎯 信頼性\n\n💬 <b>サポート:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>メ イ ン メ ニ ュ ー</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👇 <b>機能を選択してください:</b>",
-    "support": "💬 <b>サポート:</b> @Tony_M_unlock",
+    "welcome": "✨ <b>よ う こ そ</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>無料 OSINT Bot</b>\n📓 すべてのツールが解除されました\n⚡ 高速  •  🔒 安全  •  🎯 信頼性\n\n💬 <b>サポート:</b> @Tony_M_unlock",
+    "select_feature": "🛠 <b>メ イ ン メ ニ ュ ー</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>機能を選択してください:</b>",
     "cancelled": "❌ <b>キャンセルされました。</b>",
     "choose_language": "🌐 <b>言語を選択してください:</b>",
     "language_set": "✅ 言語が正常に更新されました。",
@@ -784,14 +945,13 @@ _register_lang("ja", {
     "lang_btn": "🌐 言語",
     "support_btn": "💬 サポート",
     "continue_btn": "✅ 続行",
-    "maintenance": "🛠 <b>メ ン テ ナ ン ス 中</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\nBot は一時的に利用できません。\n後でもう一度お試しください。",
+    "maintenance": "🛠 <b>メ ン テ ナ ン ス 中</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ Bot は定期メンテナンスのため一時的に<b>オフライン</b>です。\n\n🕒 しばらくしてからもう一度お試しください。\n\n💬 <b>サポート:</b> @Tony_M_unlock",
     "banned_msg": "🚫 <b>アクセスがブロックされました</b>\n\nアカウントが停止されました。",
     "current_lang": "🌐 現在の言語: <b>{name}</b>",
 })
 _register_lang("ko", {
-    "welcome": "✨ <b>환 영 합 니 다</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>무료 OSINT 봇</b>\n🔓 모든 도구 잠금 해제\n⚡ 빠름  •  🔒 안전  •  🎯 신뢰성\n\n💬 <b>지원:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>메 인 메 뉴</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👇 <b>기능을 선택하세요:</b>",
-    "support": "💬 <b>지원:</b> @Tony_M_unlock",
+    "welcome": "✨ <b>환 영 합 니 다</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>무료 OSINT 봇</b>\n📓 모든 도구 잠금 해제\n⚡ 빠름  •  🔒 안전  •  🎯 신뢰성\n\n💬 <b>지원:</b> @Tony_M_unlock",
+    "select_feature": "🛠 <b>메 인 메 뉴</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>기능을 선택하세요:</b>",
     "cancelled": "❌ <b>취소되었습니다.</b>",
     "choose_language": "🌐 <b>언어를 선택하세요:</b>",
     "language_set": "✅ 언어가 업데이트되었습니다.",
@@ -804,14 +964,13 @@ _register_lang("ko", {
     "lang_btn": "🌐 언어",
     "support_btn": "💬 지원",
     "continue_btn": "✅ 계속",
-    "maintenance": "🛠 <b>점 검 중</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n봇을 일시적으로 사용할 수 없습니다.\n나중에 다시 시도하세요.",
+    "maintenance": "🛠 <b>점 검 중</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ 봇이 예정된 점검으로 인해\n일시적으로 <b>오프라인</b>입니다.\n\n🕒 잠시 후 다시 시도해주세요.\n\n💬 <b>지원:</b> @Tony_M_unlock",
     "banned_msg": "🚫 <b>접근 차단됨</b>\n\n계정이 정지되었습니다.",
     "current_lang": "🌐 현재 언어: <b>{name}</b>",
 })
 _register_lang("tr", {
-    "welcome": "✨ <b>H O Ş   G E L D İ N İ Z</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>Ücretsiz OSINT Botu</b>\n🔓 Tüm araçlar açık\n⚡ Hızlı  •  🔒 Güvenli  •  🎯 Güvenilir\n\n💬 <b>Destek:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>A N A   M E N Ü</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👇 <b>Bir özellik seçin:</b>",
-    "support": "💬 <b>Destek:</b> @Tony_M_unlock",
+    "welcome": "✨ <b>H O Ş   G E L D İ N İ Z</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>Ücretsiz OSINT Botu</b>\n📓 Tüm araçlar açık\n⚡ Hızlı  •  🔒 Güvenli  •  🎯 Güvenilir\n\n💬 <b>Destek:</b> @Tony_M_unlock",
+    "select_feature": "🛠 <b>A N A   M E N Ü</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>Bir özellik seçin:</b>",
     "cancelled": "❌ <b>İptal edildi.</b>",
     "choose_language": "🌐 <b>Lütfen dilinizi seçin:</b>",
     "language_set": "✅ Dil başarıyla güncellendi.",
@@ -824,34 +983,32 @@ _register_lang("tr", {
     "lang_btn": "🌐 Dil",
     "support_btn": "💬 Destek",
     "continue_btn": "✅ Devam",
-    "maintenance": "🛠 <b>BAKIMDA</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\nBot geçici olarak kullanılamıyor.\nLütfen daha sonra tekrar deneyin.",
+    "maintenance": "🛠 <b>B A K I M D A</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ Bot planlı bakım nedeniyle\ngeçici olarak <b>çevrimdışı</b>.\n\n🕒 Lütfen kısa süre sonra tekrar deneyin.\n\n💬 <b>Destek:</b> @Tony_M_unlock",
     "banned_msg": "🚫 <b>ERİŞİM ENGELLENDİ</b>\n\nHesabınız askıya alındı.",
     "current_lang": "🌐 Geçerli dil: <b>{name}</b>",
 })
 _register_lang("fa", {
-    "welcome": "✨ <b>خ و ش   آ م د ی د</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>ربات OSINT رایگان</b>\n🔓 همه ابزارها فعال شد\n⚡ سریع  •  🔒 امن  •  🎯 قابل اعتماد\n\n💬 <b>پشتیبانی:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>م ن و ی   ا ص ل ی</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👇 <b>یک ویژگی انتخاب کنید:</b>",
-    "support": "💬 <b>پشتیبانی:</b> @Tony_M_unlock",
+    "welcome": "✨ <b>خ و ش   آ م د ی د</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>ربات OSINT رایگان</b>\n📓 همه ابزارها فعال شد\n⚡ سریع  •  🔒 امن  •  🎯 قابل اعتماد\n\n💬 <b>پشتیبانی:</b> @Tony_M_unlock",
+    "select_feature": "🛠 <b>م ن و ی   ا ص ل ی</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>یک ویژگی انتخاب کنید:</b>",
     "cancelled": "❌ <b>لغو شد.</b>",
     "choose_language": "🌐 <b>لطفا زبان خود را انتخاب کنید:</b>",
-    "language_set": "✅ زبان با موفقیت به‌روز شد.",
+    "language_set": "✅ زبان با موفقیت بهروز شد.",
     "send_cancel": "💡 <i>برای لغو /cancel بفرستید.</i>",
     "searching": "🔎 <i>در حال جستجو...</i>",
-    "no_result": "❌ نتیجه‌ای یافت نشد یا خطای API.",
+    "no_result": "❌ نتیجهای یافت نشد یا خطای API.",
     "select_option": "❓ لطفا یک گزینه انتخاب کنید.",
     "back": "🔙 بازگشت",
     "cancel_btn": "❌ لغو",
     "lang_btn": "🌐 زبان",
     "support_btn": "💬 پشتیبانی",
     "continue_btn": "✅ ادامه",
-    "maintenance": "🛠 <b>د ر   ح ا ل   ت ع م ی ر</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\nربات موقتاً در دسترس نیست.\nبعداً دوباره امتحان کنید.",
+    "maintenance": "🛠 <b>د ر   ح ا ل   ت ع م ی ر</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ ربات به دلیل تعمیرات برنامهریزی شده\nموقتاً <b>آفلاین</b> است.\n\n🕒 لطفاً کمی بعد دوباره تلاش کنید.\n\n💬 <b>پشتیبانی:</b> @Tony_M_unlock",
     "banned_msg": "🚫 <b>دسترسی مسدود شد</b>\n\nحساب شما تعلیق شده است.",
     "current_lang": "🌐 زبان فعلی: <b>{name}</b>",
 })
 _register_lang("it", {
-    "welcome": "✨ <b>B E N V E N U T O</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>Bot OSINT Gratuito</b>\n🔓 Tutti gli strumenti sbloccati\n⚡ Veloce  •  🔒 Sicuro  •  🎯 Affidabile\n\n💬 <b>Supporto:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>M E N U   P R I N C I P A L E</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👇 <b>Seleziona una funzione:</b>",
-    "support": "💬 <b>Supporto:</b> @Tony_M_unlock",
+    "welcome": "✨ <b>B E N V E N U T O</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>Bot OSINT Gratuito</b>\n📓 Tutti gli strumenti sbloccati\n⚡ Veloce  •  🔒 Sicuro  •  🎯 Affidabile\n\n💬 <b>Supporto:</b> @Tony_M_unlock",
+    "select_feature": "🛠 <b>M E N U   P R I N C I P A L E</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>Seleziona una funzione:</b>",
     "cancelled": "❌ <b>Annullato.</b>",
     "choose_language": "🌐 <b>Seleziona la tua lingua:</b>",
     "language_set": "✅ Lingua aggiornata.",
@@ -864,14 +1021,13 @@ _register_lang("it", {
     "lang_btn": "🌐 Lingua",
     "support_btn": "💬 Supporto",
     "continue_btn": "✅ Continua",
-    "maintenance": "🛠 <b>IN MANUTENZIONE</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\nIl bot è temporaneamente non disponibile.\nRiprova più tardi.",
+    "maintenance": "🛠 <b>I N   M A N U T E N Z I O N E</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ Il bot è temporaneamente <b>offline</b>\nper manutenzione programmata.\n\n🕒 Riprova tra qualche istante.\n\n💬 <b>Supporto:</b> @Tony_M_unlock",
     "banned_msg": "🚫 <b>ACCESSO BLOCCATO</b>\n\nIl tuo account è stato sospeso.",
     "current_lang": "🌐 Lingua attuale: <b>{name}</b>",
 })
 _register_lang("vi", {
-    "welcome": "✨ <b>C H À O   M Ừ N G</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>Bot OSINT Miễn phí</b>\n🔓 Tất cả công cụ đã mở khóa\n⚡ Nhanh  •  🔒 An toàn  •  🎯 Đáng tin\n\n💬 <b>Hỗ trợ:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>M E N U   C H Í N H</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👇 <b>Chọn một tính năng:</b>",
-    "support": "💬 <b>Hỗ trợ:</b> @Tony_M_unlock",
+    "welcome": "✨ <b>C H À O   M Ừ N G</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>Bot OSINT Miễn phí</b>\n📓 Tất cả công cụ đã mở khóa\n⚡ Nhanh  •  🔒 An toàn  •  🎯 Đáng tin\n\n💬 <b>Hỗ trợ:</b> @Tony_M_unlock",
+    "select_feature": "🛠 <b>M E N U   C H Í N H</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>Chọn một tính năng:</b>",
     "cancelled": "❌ <b>Đã hủy.</b>",
     "choose_language": "🌐 <b>Vui lòng chọn ngôn ngữ:</b>",
     "language_set": "✅ Đã cập nhật ngôn ngữ.",
@@ -884,14 +1040,13 @@ _register_lang("vi", {
     "lang_btn": "🌐 Ngôn ngữ",
     "support_btn": "💬 Hỗ trợ",
     "continue_btn": "✅ Tiếp tục",
-    "maintenance": "🛠 <b>Đ A N G   B Ả O   T R Ì</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\nBot tạm thời không khả dụng.\nVui lòng thử lại sau.",
+    "maintenance": "🛠 <b>Đ A N G   B Ả O   T R Ì</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ Bot tạm thời <b>offline</b>\nđể bảo trì theo lịch.\n\n🕒 Vui lòng thử lại sau ít phút.\n\n💬 <b>Hỗ trợ:</b> @Tony_M_unlock",
     "banned_msg": "🚫 <b>TRUY CẬP BỊ CHẶN</b>\n\nTài khoản của bạn đã bị đình chỉ.",
     "current_lang": "🌐 Ngôn ngữ hiện tại: <b>{name}</b>",
 })
 _register_lang("th", {
-    "welcome": "✨ <b>ยิ น ดี ต้ อ น รั บ</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>บอท OSINT ฟรี</b>\n🔓 ปลดล็อกเครื่องมือทั้งหมด\n⚡ เร็ว  •  🔒 ปลอดภัย  •  🎯 เชื่อถือได้\n\n💬 <b>สนับสนุน:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>เม นู ห ลั ก</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👇 <b>เลือกคุณสมบัติ:</b>",
-    "support": "💬 <b>สนับสนุน:</b> @Tony_M_unlock",
+    "welcome": "✨ <b>ย ิ น ดี ต ้ อ น ร ั บ</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>บอท OSINT ฟรี</b>\n📓 ปลดล็อกเครื่องมือทั้งหมด\n⚡ เร็ว  •  🔒 ปลอดภัย  •  🎯 เชื่อถือได้\n\n💬 <b>สนับสนุน:</b> @Tony_M_unlock",
+    "select_feature": "🛠 <b>เ ม น ู ห ล ั ก</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>เลือกคุณสมบัติ:</b>",
     "cancelled": "❌ <b>ยกเลิกแล้ว</b>",
     "choose_language": "🌐 <b>เลือกภาษาของคุณ:</b>",
     "language_set": "✅ อัปเดตภาษาเรียบร้อย",
@@ -904,14 +1059,13 @@ _register_lang("th", {
     "lang_btn": "🌐 ภาษา",
     "support_btn": "💬 สนับสนุน",
     "continue_btn": "✅ ดำเนินการต่อ",
-    "maintenance": "🛠 <b>อ ยู่ ร ะ ห ว่ า ง ก า ร บำ รุ ง รั ก ษ า</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\nบอทไม่พร้อมใช้งานชั่วคราว\nโปรดลองใหม่ภายหลัง",
+    "maintenance": "🛠 <b>อ ย ู ่ ร ะ ห ว ่ า ง ก า ร บ ำ ร ุ ง ร ั ก ษ า</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ บอท <b>ออฟไลน์</b> ชั่วคราว\nเนื่องจากการบำรุงรักษาตามกำหนด\n\n🕒 โปรดลองใหม่ภายหลัง\n\n💬 <b>สนับสนุน:</b> @Tony_M_unlock",
     "banned_msg": "🚫 <b>การเข้าถึงถูกบล็อก</b>\n\nบัญชีของคุณถูกระงับ",
     "current_lang": "🌐 ภาษาปัจจุบัน: <b>{name}</b>",
 })
 _register_lang("ta", {
-    "welcome": "✨ <b>வ ர வே ற் பு</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>இலவச OSINT போட்</b>\n🔓 அனைத்து கருவிகளும் திறக்கப்பட்டன\n⚡ வேகம்  •  🔒 பாதுகாப்பு  •  🎯 நம்பகத்தன்மை\n\n💬 <b>ஆதரவு:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>மு க் கி ய   மெ  னு</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👇 <b>ஒரு அம்சத்தை தேர்ந்தெடுக்கவும்:</b>",
-    "support": "💬 <b>ஆதரவு:</b> @Tony_M_unlock",
+    "welcome": "✨ <b>வ ர வ ே ற ் ப ு</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>இலவச OSINT போட்</b>\n📓 அனைத்து கருவிகளும் திறக்கப்பட்டன\n⚡ வேகம்  •  🔒 பாதுகாப்பு  •  🎯 நம்பகத்தன்மை\n\n💬 <b>ஆதரவு:</b> @Tony_M_unlock",
+    "select_feature": "🛠 <b>ம ு க ் க ி ய   ம ெ ன ு</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>ஒரு அம்சத்தை தேர்ந்தெடுக்கவும்:</b>",
     "cancelled": "❌ <b>ரத்து செய்யப்பட்டது.</b>",
     "choose_language": "🌐 <b>உங்கள் மொழியை தேர்ந்தெடுக்கவும்:</b>",
     "language_set": "✅ மொழி புதுப்பிக்கப்பட்டது.",
@@ -924,14 +1078,13 @@ _register_lang("ta", {
     "lang_btn": "🌐 மொழி",
     "support_btn": "💬 ஆதரவு",
     "continue_btn": "✅ தொடரவும்",
-    "maintenance": "🛠 <b>ப ரா ம ரி ப் பு   ந டை   பெ று கி ற து</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\nபோட் தற்காலிகமாக கிடைக்கவில்லை.\nபின்னர் மீண்டும் முயற்சிக்கவும்.",
+    "maintenance": "🛠 <b>ப ர ா ம ர ி ப ் ப ு   ந ட ை ப ெ ற ு க ி ற த ு</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ திட்டமிடப்பட்ட பராமரிப்பு காரணமாக\nபோட் தற்காலிகமாக <b>ஆஃப்லைன்</b> உள்ளது.\n\n🕒 சிறிது நேரம் கழித்து மீண்டும் முயற்சிக்கவும்.\n\n💬 <b>ஆதரவு:</b> @Tony_M_unlock",
     "banned_msg": "🚫 <b>அணுகல் தடுக்கப்பட்டது</b>\n\nஉங்கள் கணக்கு இடைநிறுத்தப்பட்டது.",
     "current_lang": "🌐 தற்போதைய மொழி: <b>{name}</b>",
 })
 _register_lang("te", {
-    "welcome": "✨ <b>స్వా గ తం</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>ఉచిత OSINT బాట్</b>\n🔓 అన్ని సాధనాలు అన్‌లాక్\n⚡ వేగంగా  •  🔒 సురక్షితం  •  🎯 విశ్వసనీయం\n\n💬 <b>మద్దతు:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>ప్ర ధా న   మె నూ</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👇 <b>ఒక ఫీచర్ ఎంచుకోండి:</b>",
-    "support": "💬 <b>మద్దతు:</b> @Tony_M_unlock",
+    "welcome": "✨ <b>స ్ వ ా గ త ం</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>ఉచిత OSINT బాట్</b>\n📓 అన్ని సాధనాలు అన్లాక్\n⚡ వేగం  •  🔒 సురక్షితం  •  🎯 విశ్వసనీయం\n\n💬 <b>మద్దతు:</b> @Tony_M_unlock",
+    "select_feature": "🛠 <b>ప ్ ర ధ ా న   మ ె న ూ</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>ఒక ఫీచర్ ఎంచుకోండి:</b>",
     "cancelled": "❌ <b>రద్దు చేయబడింది.</b>",
     "choose_language": "🌐 <b>మీ భాషను ఎంచుకోండి:</b>",
     "language_set": "✅ భాష నవీకరించబడింది.",
@@ -944,19 +1097,18 @@ _register_lang("te", {
     "lang_btn": "🌐 భాష",
     "support_btn": "💬 మద్దతు",
     "continue_btn": "✅ కొనసాగించు",
-    "maintenance": "🛠 <b>ని ర్వ హ ణ  లో  ఉం ది</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\nబాట్ తాత్కాలికంగా అందుబాటులో లేదు.\nతర్వాత మళ్లీ ప్రయత్నించండి.",
+    "maintenance": "🛠 <b>న ి ర ్ వ హ ణ   ల ో   ఉ ం ద ి</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ షెడ్యూల్ నిర్వహణ కారణంగా\nబాట్ తాత్కాలికంగా <b>ఆఫ్లైన్</b>.\n\n🕒 కొద్దిసేపటి తర్వాత మళ్లీ ప్రయత్నించండి.\n\n💬 <b>మద్దతు:</b> @Tony_M_unlock",
     "banned_msg": "🚫 <b>యాక్సెస్ బ్లాక్ చేయబడింది</b>\n\nమీ ఖాతా సస్పెండ్ చేయబడింది.",
     "current_lang": "🌐 ప్రస్తుత భాష: <b>{name}</b>",
 })
 _register_lang("mr", {
-    "welcome": "✨ <b>स्वा ग त</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>मोफत OSINT बॉट</b>\n🔓 सर्व साधने अनलॉक\n⚡ वेगवान  •  🔒 सुरक्षित  •  🎯 विश्वसनीय\n\n💬 <b>सपोर्ट:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>मु ख्य   मे नू</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👇 <b>वैशिष्ट्य निवडा:</b>",
-    "support": "💬 <b>सपोर्ट:</b> @Tony_M_unlock",
+    "welcome": "✨ <b>स ् व ा ग त</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>मोफत OSINT बॉट</b>\n📓 सर्व साधने अनलॉक\n⚡ वेगवान  •  🔒 सुरक्षित  •  🎯 विश्वसनीय\n\n💬 <b>सपोर्ट:</b> @Tony_M_unlock",
+    "select_feature": "🛠 <b>म ु ख ् य   म े न ू</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>वैशिष्ट्य निवडा:</b>",
     "cancelled": "❌ <b>रद्द केले.</b>",
     "choose_language": "🌐 <b>तुमची भाषा निवडा:</b>",
     "language_set": "✅ भाषा अपडेट झाली.",
     "send_cancel": "💡 <i>रद्द करण्यासाठी /cancel पाठवा.</i>",
-    "searching": "🔎 <i>शोधत आहे...</i>",
+    "searching": "🔎 <i>शोधत आहोत...</i>",
     "no_result": "❌ निकाल नाही किंवा API त्रुटी.",
     "select_option": "❓ मेनूमधून पर्याय निवडा.",
     "back": "🔙 मागे",
@@ -964,14 +1116,13 @@ _register_lang("mr", {
     "lang_btn": "🌐 भाषा",
     "support_btn": "💬 सपोर्ट",
     "continue_btn": "✅ सुरू ठेवा",
-    "maintenance": "🛠 <b>दे ख भा ल   सु रू</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\nबॉट तात्पुरते अनुपलब्ध आहे.\nनंतर पुन्हा प्रयत्न करा.",
+    "maintenance": "🛠 <b>द े ख भ ा ल   स ु र ू</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ नियोजित देखभालीमुळे\nबॉट तात्पुरता <b>ऑफलाइन</b> आहे.\n\n🕒 कृपया थोड्या वेळाने पुन्हा प्रयत्न करा.\n\n💬 <b>सपोर्ट:</b> @Tony_M_unlock",
     "banned_msg": "🚫 <b>प्रवेश अवरोधित</b>\n\nतुमचे खाते निलंबित केले आहे.",
     "current_lang": "🌐 सध्याची भाषा: <b>{name}</b>",
 })
 _register_lang("gu", {
-    "welcome": "✨ <b>સ્વા ગ ત</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>મફત OSINT બોટ</b>\n🔓 બધા સાધનો અનલૉક\n⚡ ઝડપી  •  🔒 સુરક્ષિત  •  🎯 વિશ્વસનીય\n\n💬 <b>સપોર્ટ:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>મુ ખ્ય   મે નૂ</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👇 <b>એક સુવિધા પસંદ કરો:</b>",
-    "support": "💬 <b>સપોર્ટ:</b> @Tony_M_unlock",
+    "welcome": "✨ <b>સ ્ વ ા ગ ત</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>મફત OSINT બોટ</b>\n📓 બધા સાધનો અનલૉક\n⚡ ઝડપી  •  🔒 સુરક્ષિત  •  🎯 વિશ્વસનીય\n\n💬 <b>સપોર્ટ:</b> @Tony_M_unlock",
+    "select_feature": "🛠 <b>મ ુ ખ ્ ય   મ ે ન ૂ</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>એક સુવિધા પસંદ કરો:</b>",
     "cancelled": "❌ <b>રદ કર્યું.</b>",
     "choose_language": "🌐 <b>તમારી ભાષા પસંદ કરો:</b>",
     "language_set": "✅ ભાષા અપડેટ થઈ.",
@@ -984,14 +1135,13 @@ _register_lang("gu", {
     "lang_btn": "🌐 ભાષા",
     "support_btn": "💬 સપોર્ટ",
     "continue_btn": "✅ ચાલુ રાખો",
-    "maintenance": "🛠 <b>જા ળ વ ણી   ચા લુ   છે</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\nબોટ અસ્થાયી રૂપે અનુપલબ્ધ છે.\nપછી ફરી પ્રયાસ કરો.",
+    "maintenance": "🛠 <b>જ ા ળ વ ણ ી   ચ ા લ ુ   છ ે</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ નિર્ધારિત જાળવણીને કારણે\nબોટ અસ્થાયી રૂપે <b>ઑફલાઇન</b> છે.\n\n🕒 થોડા સમય પછી ફરી પ્રયાસ કરો.\n\n💬 <b>સપોર્ટ:</b> @Tony_M_unlock",
     "banned_msg": "🚫 <b>એક્સેસ બ્લોક</b>\n\nતમારું એકાઉન્ટ સસ્પેન્ડ કર્યું છે.",
     "current_lang": "🌐 વર્તમાન ભાષા: <b>{name}</b>",
 })
 _register_lang("pa", {
-    "welcome": "✨ <b>ਜੀ   ਆ ਇ ਆਂ   ਨੂੰ</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>ਮੁਫ਼ਤ OSINT ਬੋਟ</b>\n🔓 ਸਾਰੇ ਸਾਧਨ ਅਨਲੌਕ\n⚡ ਤੇਜ਼  •  🔒 ਸੁਰੱਖਿਅਤ  •  🎯 ਭਰੋਸੇਯੋਗ\n\n💬 <b>ਸਪੋਰਟ:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>ਮੁੱ ਖ   ਮੀ ਨੂ</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👇 <b>ਇੱਕ ਵਿਸ਼ੇਸ਼ਤਾ ਚੁਣੋ:</b>",
-    "support": "💬 <b>ਸਪੋਰਟ:</b> @Tony_M_unlock",
+    "welcome": "✨ <b>ਜ ੀ   ਆ ਇ ਆ ਂ   ਨ ੂ ਂ</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>ਮੁਫ਼ਤ OSINT ਬੋਟ</b>\n📓 ਸਾਰੇ ਸਾਧਨ ਅਨਲੌਕ\n⚡ ਤੇਜ਼  •  🔒 ਸੁਰੱਖਿਅਤ  •  🎯 ਭਰੋਸੇਯੋਗ\n\n💬 <b>ਸਪੋਰਟ:</b> @Tony_M_unlock",
+    "select_feature": "🛠 <b>ਮ ੁ ਖ   ਮ ੀ ਨ ੂ</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>ਇੱਕ ਵਿਸ਼ੇਸ਼ਤਾ ਚੁਣੋ:</b>",
     "cancelled": "❌ <b>ਰੱਦ ਕੀਤਾ।</b>",
     "choose_language": "🌐 <b>ਆਪਣੀ ਭਾਸ਼ਾ ਚੁਣੋ:</b>",
     "language_set": "✅ ਭਾਸ਼ਾ ਅੱਪਡੇਟ ਹੋ ਗਈ।",
@@ -1004,14 +1154,13 @@ _register_lang("pa", {
     "lang_btn": "🌐 ਭਾਸ਼ਾ",
     "support_btn": "💬 ਸਪੋਰਟ",
     "continue_btn": "✅ ਜਾਰੀ ਰੱਖੋ",
-    "maintenance": "🛠 <b>ਰੱ ਖ-ਰ ਖਾ ਅ   ਜਾ ਰੀ   ਹੈ</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\nਬੋਟ ਅਸਥਾਈ ਤੌਰ ਤੇ ਉਪਲਬਧ ਨਹੀਂ ਹੈ।\nਬਾਅਦ ਵਿੱਚ ਦੁਬਾਰਾ ਕੋਸ਼ਿਸ਼ ਕਰੋ।",
+    "maintenance": "🛠 <b>ਰ ੱ ਖ - ਰ ਖ ਾ ਵ   ਜ ਾ ਰ ੀ   ਹ ੈ</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ ਤਹਿ ਕੀਤੀ ਸੰਭਾਲ ਕਾਰਨ\nਬੋਟ ਅਸਥਾਈ ਤੌਰ ਤੇ <b>ਔਫਲਾਈਨ</b> ਹੈ।\n\n🕒 ਕਿਰਪਾ ਕਰਕੇ ਥੋੜ੍ਹੀ ਦੇਰ ਬਾਅਦ ਦੁਬਾਰਾ ਕੋਸ਼ਿਸ਼ ਕਰੋ।\n\n💬 <b>ਸਪੋਰਟ:</b> @Tony_M_unlock",
     "banned_msg": "🚫 <b>ਪਹੁੰਚ ਬਲੌਕ</b>\n\nਤੁਹਾਡਾ ਖਾਤਾ ਮੁਅੱਤਲ ਕੀਤਾ ਗਿਆ ਹੈ।",
     "current_lang": "🌐 ਮੌਜੂਦਾ ਭਾਸ਼ਾ: <b>{name}</b>",
 })
 _register_lang("ml", {
-    "welcome": "✨ <b>സ്വാ ഗ തം</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>സൗജന്യ OSINT ബോട്ട്</b>\n🔓 എല്ലാ ഉപകരണങ്ങളും അൺലോക്ക്\n⚡ വേഗം  •  🔒 സുരക്ഷിതം  •  🎯 വിശ്വസനീയം\n\n💬 <b>പിന്തുണ:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>പ്ര ധാ ന   മെ നു</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👇 <b>ഒരു സവിശേഷത തിരഞ്ഞെടുക്കുക:</b>",
-    "support": "💬 <b>പിന്തുണ:</b> @Tony_M_unlock",
+    "welcome": "✨ <b>സ ് വ ാ ഗ ത ം</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>സൗജന്യ OSINT ബോട്ട്</b>\n📓 എല്ലാ ഉപകരണങ്ങളും അൺലോക്ക്\n⚡ വേഗം  •  🔒 സുരക്ഷിതം  •  🎯 വിശ്വസനീയം\n\n💬 <b>പിന്തുണ:</b> @Tony_M_unlock",
+    "select_feature": "🛠 <b>പ ് ര ധ ా ന   മ െ ന ു</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>ഒരു സവിശേഷത തിരഞ്ഞെടുക്കുക:</b>",
     "cancelled": "❌ <b>റദ്ദാക്കി.</b>",
     "choose_language": "🌐 <b>നിങ്ങളുടെ ഭാഷ തിരഞ്ഞെടുക്കുക:</b>",
     "language_set": "✅ ഭാഷ അപ്ഡേറ്റ് ചെയ്തു.",
@@ -1024,14 +1173,13 @@ _register_lang("ml", {
     "lang_btn": "🌐 ഭാഷ",
     "support_btn": "💬 പിന്തുണ",
     "continue_btn": "✅ തുടരുക",
-    "maintenance": "🛠 <b>അ റ്റ ക  ന്ന ന്റ്   ന ട ക  ന്നു</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\nബോട്ട് താൽക്കാലികമായി ലഭ്യമല്ല.\nപിന്നീട് വീണ്ടും ശ്രമിക്കുക.",
+    "maintenance": "🛠 <b>അ റ ് റ ് ക ു ട ് ത ൽ   ന ട ക ് ക ു ന ് ന ു</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ ഷെഡ്യൂൾ ചെയ്ത അറ്റകുറ്റപ്പണി കാരണം\nബോട്ട് താൽക്കാലികമായി <b>ഓഫ്ലൈൻ</b> ആണ്.\n\n🕒 കുറച്ചു കഴിഞ്ഞ് വീണ്ടും ശ്രമിക്കുക.\n\n💬 <b>പിന്തുണ:</b> @Tony_M_unlock",
     "banned_msg": "🚫 <b>ആക്സസ് ബ്ലോക്ക്</b>\n\nനിങ്ങളുടെ അക്കൗണ്ട് സസ്പെൻഡ് ചെയ്തു.",
     "current_lang": "🌐 നിലവിലെ ഭാഷ: <b>{name}</b>",
 })
 _register_lang("nl", {
-    "welcome": "✨ <b>W E L K O M</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>Gratis OSINT Bot</b>\n🔓 Alle tools ontgrendeld\n⚡ Snel  •  🔒 Veilig  •  🎯 Betrouwbaar\n\n💬 <b>Ondersteuning:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>H O O F D M E N U</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👇 <b>Selecteer een functie:</b>",
-    "support": "💬 <b>Ondersteuning:</b> @Tony_M_unlock",
+    "welcome": "✨ <b>W E L K O M</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>Gratis OSINT Bot</b>\n📓 Alle tools ontgrendeld\n⚡ Snel  •  🔒 Veilig  •  🎯 Betrouwbaar\n\n💬 <b>Ondersteuning:</b> @Tony_M_unlock",
+    "select_feature": "🛠 <b>H O O F D M E N U</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>Selecteer een functie:</b>",
     "cancelled": "❌ <b>Geannuleerd.</b>",
     "choose_language": "🌐 <b>Kies uw taal:</b>",
     "language_set": "✅ Taal succesvol bijgewerkt.",
@@ -1044,14 +1192,13 @@ _register_lang("nl", {
     "lang_btn": "🌐 Taal",
     "support_btn": "💬 Ondersteuning",
     "continue_btn": "✅ Doorgaan",
-    "maintenance": "🛠 <b>ONDERHOUD</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\nDe bot is tijdelijk niet beschikbaar.\nProbeer het later opnieuw.",
+    "maintenance": "🛠 <b>O N D E R H O U D</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ De bot is tijdelijk <b>offline</b>\nvanwege gepland onderhoud.\n\n🕒 Probeer het over een moment opnieuw.\n\n💬 <b>Ondersteuning:</b> @Tony_M_unlock",
     "banned_msg": "🚫 <b>TOEGANG GEBLOKKEERD</b>\n\nUw account is opgeschort.",
     "current_lang": "🌐 Huidige taal: <b>{name}</b>",
 })
 _register_lang("pl", {
-    "welcome": "✨ <b>W I T A M Y</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>Darmowy Bot OSINT</b>\n🔓 Wszystkie narzędzia odblokowane\n⚡ Szybko  •  🔒 Bezpiecznie  •  🎯 Niezawodnie\n\n💬 <b>Wsparcie:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>M E N U   G Ł Ó W N E</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👇 <b>Wybierz funkcję:</b>",
-    "support": "💬 <b>Wsparcie:</b> @Tony_M_unlock",
+    "welcome": "✨ <b>W I T A M Y</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>Darmowy Bot OSINT</b>\n📓 Wszystkie narzędzia odblokowane\n⚡ Szybko  •  🔒 Bezpiecznie  •  🎯 Niezawodnie\n\n💬 <b>Wsparcie:</b> @Tony_M_unlock",
+    "select_feature": "🛠 <b>M E N U   G Ł Ó W N E</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>Wybierz funkcję:</b>",
     "cancelled": "❌ <b>Anulowano.</b>",
     "choose_language": "🌐 <b>Wybierz swój język:</b>",
     "language_set": "✅ Język zaktualizowany.",
@@ -1064,14 +1211,13 @@ _register_lang("pl", {
     "lang_btn": "🌐 Język",
     "support_btn": "💬 Wsparcie",
     "continue_btn": "✅ Kontynuuj",
-    "maintenance": "🛠 <b>KONSERWACJA</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\nBot jest tymczasowo niedostępny.\nSpróbuj ponownie później.",
+    "maintenance": "🛠 <b>K O N S E R W A C J A</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ Bot jest tymczasowo <b>offline</b>\nz powodu zaplanowanej konserwacji.\n\n🕒 Spróbuj ponownie za chwilę.\n\n💬 <b>Wsparcie:</b> @Tony_M_unlock",
     "banned_msg": "🚫 <b>DOSTĘP ZABLOKOWANY</b>\n\nTwoje konto zostało zawieszone.",
     "current_lang": "🌐 Aktualny język: <b>{name}</b>",
 })
 _register_lang("uk", {
-    "welcome": "✨ <b>Л А С К А В О   П Р О С И М О</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>Безкоштовний OSINT-бот</b>\n🔓 Усі інструменти розблоковано\n⚡ Швидко  •  🔒 Безпечно  •  🎯 Надійно\n\n💬 <b>Підтримка:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>Г О Л О В Н Е   М Е Н Ю</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👇 <b>Оберіть функцію:</b>",
-    "support": "💬 <b>Підтримка:</b> @Tony_M_unlock",
+    "welcome": "✨ <b>Л А С К А В О   П Р О С И М О</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>Безкоштовний OSINT-бот</b>\n📓 Усі інструменти розблоковано\n⚡ Швидко  •  🔒 Безпечно  •  🎯 Надійно\n\n💬 <b>Підтримка:</b> @Tony_M_unlock",
+    "select_feature": "🛠 <b>Г О Л О В Н Е   М Е Н Ю</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>Оберіть функцію:</b>",
     "cancelled": "❌ <b>Скасовано.</b>",
     "choose_language": "🌐 <b>Оберіть мову:</b>",
     "language_set": "✅ Мову оновлено.",
@@ -1084,14 +1230,13 @@ _register_lang("uk", {
     "lang_btn": "🌐 Мова",
     "support_btn": "💬 Підтримка",
     "continue_btn": "✅ Продовжити",
-    "maintenance": "🛠 <b>О Б С Л У Г О В У В А Н Н Я</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\nБот тимчасово недоступний.\nСпробуйте пізніше.",
+    "maintenance": "🛠 <b>О Б С Л У Г О В У В А Н Н Я</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ Бот тимчасово <b>недоступний</b>\nчерез планове обслуговування.\n\n🕒 Спробуйте пізніше.\n\n💬 <b>Підтримка:</b> @Tony_M_unlock",
     "banned_msg": "🚫 <b>ДОСТУП ЗАБЛОКОВАНО</b>\n\nВаш акаунт призупинено.",
     "current_lang": "🌐 Поточна мова: <b>{name}</b>",
 })
 _register_lang("ro", {
-    "welcome": "✨ <b>B I N E   A Ț I   V E N I T</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>Bot OSINT Gratuit</b>\n🔓 Toate instrumentele deblocate\n⚡ Rapid  •  🔒 Sigur  •  🎯 Fiabil\n\n💬 <b>Suport:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>M E N I U   P R I N C I P A L</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👇 <b>Selectați o funcție:</b>",
-    "support": "💬 <b>Suport:</b> @Tony_M_unlock",
+    "welcome": "✨ <b>B I N E   A Ț I   V E N I T</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>Bot OSINT Gratuit</b>\n📓 Toate instrumentele deblocate\n⚡ Rapid  •  🔒 Sigur  •  🎯 Fiabil\n\n💬 <b>Suport:</b> @Tony_M_unlock",
+    "select_feature": "🛠 <b>M E N I U   P R I N C I P A L</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>Selectați o funcție:</b>",
     "cancelled": "❌ <b>Anulat.</b>",
     "choose_language": "🌐 <b>Alegeți limba:</b>",
     "language_set": "✅ Limba a fost actualizată.",
@@ -1104,14 +1249,13 @@ _register_lang("ro", {
     "lang_btn": "🌐 Limbă",
     "support_btn": "💬 Suport",
     "continue_btn": "✅ Continuă",
-    "maintenance": "🛠 <b>ÎN MENTENANȚĂ</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\nBotul este temporar indisponibil.\nÎncercați mai târziu.",
+    "maintenance": "🛠 <b>Î N   M E N T E N A N Ț Ă</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ Botul este temporar <b>offline</b>\npentru mentenanță programată.\n\n🕒 Încercați din nou în curând.\n\n💬 <b>Suport:</b> @Tony_M_unlock",
     "banned_msg": "🚫 <b>ACCES BLOCAT</b>\n\nContul dvs. a fost suspendat.",
     "current_lang": "🌐 Limba curentă: <b>{name}</b>",
 })
 _register_lang("sw", {
-    "welcome": "✨ <b>K A R I B U</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>Bot ya OSINT ya Bure</b>\n🔓 Zana zote zimefunguliwa\n⚡ Haraka  •  🔒 Salama  •  🎯 Kuaminika\n\n💬 <b>Msaada:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>M E N Y U   K U U</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👇 <b>Chagua kipengele:</b>",
-    "support": "💬 <b>Msaada:</b> @Tony_M_unlock",
+    "welcome": "✨ <b>K A R I B U</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>Bot ya OSINT ya Bure</b>\n📓 Zana zote zimefunguliwa\n⚡ Haraka  •  🔒 Salama  •  🎯 Kuaminika\n\n💬 <b>Msaada:</b> @Tony_M_unlock",
+    "select_feature": "🛠 <b>M E N Y U   K U U</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>Chagua kipengele:</b>",
     "cancelled": "❌ <b>Imefutwa.</b>",
     "choose_language": "🌐 <b>Chagua lugha yako:</b>",
     "language_set": "✅ Lugha imesasishwa.",
@@ -1124,14 +1268,13 @@ _register_lang("sw", {
     "lang_btn": "🌐 Lugha",
     "support_btn": "💬 Msaada",
     "continue_btn": "✅ Endelea",
-    "maintenance": "🛠 <b>MATENGENEZO</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\nBot haipatikani kwa muda.\nJaribu tena baadaye.",
+    "maintenance": "🛠 <b>M A T E N G E N E Z O</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ Bot haipatikani kwa muda\nkwa matengenezo yaliyopangwa.\n\n🕒 Jaribu tena baadaye kidogo.\n\n💬 <b>Msaada:</b> @Tony_M_unlock",
     "banned_msg": "🚫 <b>Ufikiaji Umezuiwa</b>\n\nAkaunti yako imesimamishwa.",
     "current_lang": "🌐 Lugha ya sasa: <b>{name}</b>",
 })
 _register_lang("ms", {
-    "welcome": "✨ <b>S E L A M A T   D A T A N G</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>Bot OSINT Percuma</b>\n🔓 Semua alat dibuka\n⚡ Pantas  •  🔒 Selamat  •  🎯 Boleh dipercayai\n\n💬 <b>Sokongan:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>M E N U   U T A M A</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👇 <b>Pilih ciri:</b>",
-    "support": "💬 <b>Sokongan:</b> @Tony_M_unlock",
+    "welcome": "✨ <b>S E L A M A T   D A T A N G</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>Bot OSINT Percuma</b>\n📓 Semua alat dibuka\n⚡ Pantas  •  🔒 Selamat  •  🎯 Boleh dipercayai\n\n💬 <b>Sokongan:</b> @Tony_M_unlock",
+    "select_feature": "🛠 <b>M E N U   U T A M A</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>Pilih ciri:</b>",
     "cancelled": "❌ <b>Dibatalkan.</b>",
     "choose_language": "🌐 <b>Pilih bahasa anda:</b>",
     "language_set": "✅ Bahasa dikemas kini.",
@@ -1144,14 +1287,13 @@ _register_lang("ms", {
     "lang_btn": "🌐 Bahasa",
     "support_btn": "💬 Sokongan",
     "continue_btn": "✅ Teruskan",
-    "maintenance": "🛠 <b>PENYELENGGARAAN</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\nBot tidak tersedia sementara.\nCuba lagi nanti.",
+    "maintenance": "🛠 <b>P E N Y E L E N G G A R A A N</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ Bot tidak tersedia sementara\nuntuk penyelenggaraan berjadual.\n\n🕒 Cuba lagi sebentar lagi.\n\n💬 <b>Sokongan:</b> @Tony_M_unlock",
     "banned_msg": "🚫 <b>AKSES DIBLOK</b>\n\nAkaun anda telah digantung.",
     "current_lang": "🌐 Bahasa semasa: <b>{name}</b>",
 })
 _register_lang("fil", {
-    "welcome": "✨ <b>M A L I G A Y A N G   P A G D A T I N G</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>Libreng OSINT Bot</b>\n🔓 Naka-unlock lahat ng tool\n⚡ Mabilis  •  🔒 Ligtas  •  🎯 Maaasahan\n\n💬 <b>Suporta:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>P A N G U N A H I N G   M E N U</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👇 <b>Pumili ng feature:</b>",
-    "support": "💬 <b>Suporta:</b> @Tony_M_unlock",
+    "welcome": "✨ <b>M A L I G A Y A N G   P A G D A T I N G</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>Libreng OSINT Bot</b>\n📓 Naka-unlock lahat ng tool\n⚡ Mabilis  •  🔒 Ligtas  •  🎯 Maaasahan\n\n💬 <b>Suporta:</b> @Tony_M_unlock",
+    "select_feature": "🛠 <b>P A N G U N A H I N G   M E N U</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>Pumili ng feature:</b>",
     "cancelled": "❌ <b>Kinansela.</b>",
     "choose_language": "🌐 <b>Pumili ng wika:</b>",
     "language_set": "✅ Na-update ang wika.",
@@ -1164,7 +1306,7 @@ _register_lang("fil", {
     "lang_btn": "🌐 Wika",
     "support_btn": "💬 Suporta",
     "continue_btn": "✅ Magpatuloy",
-    "maintenance": "🛠 <b>PAGPAPANATILI</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\nPansamantalang hindi available ang bot.\nSubukan muli mamaya.",
+    "maintenance": "🛠 <b>P A G P A P A N A T I L I</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ Pansamantalang <b>offline</b> ang bot\npara sa naka-iskedyul na pagpapanatili.\n\n🕒 Subukan muli mamaya.\n\n💬 <b>Suporta:</b> @Tony_M_unlock",
     "banned_msg": "🚫 <b>NAKA-BLOCK ANG ACCESS</b>\n\nSinuspinde ang iyong account.",
     "current_lang": "🌐 Kasalukuyang wika: <b>{name}</b>",
 })
@@ -1410,6 +1552,28 @@ def get_chat_member(chat_id, user_id):
         return None
 
 
+def leave_chat(chat_id):
+    """Force the user bot to leave a group / supergroup / channel."""
+    try:
+        HTTP.post(f"{USER_TG_API}/leaveChat",
+                  data={"chat_id": chat_id},
+                  timeout=(5, 10))
+        print(f"👋 User bot left chat {chat_id}")
+    except Exception as e:
+        print(f"leaveChat err: {e}")
+
+
+def leave_admin_chat(chat_id):
+    """Force the admin bot to leave a group / supergroup / channel."""
+    try:
+        ADMIN_HTTP.post(f"{ADMIN_TG_APIS[1]}/leaveChat",
+                        data={"chat_id": chat_id},
+                        timeout=(5, 10))
+        print(f"👋 Admin bot left chat {chat_id}")
+    except Exception as e:
+        print(f"admin leaveChat err: {e}")
+
+
 # ============================================================
 # 11. FORCE-JOIN MEMBERSHIP CHECK
 # ============================================================
@@ -1475,7 +1639,6 @@ def main_keyboard(lang="en"):
 
 
 def language_keyboard(page=0):
-    """Paginated 2-column layout — 20 languages per page."""
     codes = list(LANGUAGES.keys())
     per_page = 20
     total = len(codes)
@@ -1489,7 +1652,6 @@ def language_keyboard(page=0):
             row.append({"text": LANGUAGES[c], "callback_data": f"lang:{c}"})
         rows.append(row)
 
-    # Nav row
     nav = []
     if page > 0:
         nav.append({"text": "⬅️ Prev", "callback_data": f"langpage:{page - 1}"})
@@ -1533,6 +1695,7 @@ def owner_panel_keyboard():
     return {"inline_keyboard": [
         [{"text": "🛡  Admin Management", "callback_data": "owner:admins"},
          {"text": "⚙️  System Settings",  "callback_data": "owner:system"}],
+        [{"text": "🗂  Data Files (JSON)", "callback_data": "owner:files"}],
         [{"text": "🔙  Back to Admin",    "callback_data": "admin:back"}],
     ]}
 
@@ -1615,10 +1778,9 @@ def _send_long(chat_id, text, keyboard=None):
 
 
 # ============================================================
-# 15. MAINTENANCE HELPER (used everywhere)
+# 15. MAINTENANCE HELPER
 # ============================================================
 def _send_maintenance(chat_id, lang):
-    """Send the REPAIRING image + maintenance caption."""
     img = IMAGES.get("maintenance")
     if img and (img in IMAGE_CACHE or os.path.exists(img)):
         send_photo(chat_id, img, caption=t(lang, "maintenance"))
@@ -1632,10 +1794,14 @@ def _send_maintenance(chat_id, lang):
 def process_callback(cb):
     data = cb.get("data", "") or ""
     msg = cb.get("message") or {}
-    chat_id = (msg.get("chat") or {}).get("id")
+    chat = msg.get("chat") or {}
+    chat_id = chat.get("id")
     msg_id = msg.get("message_id")
     cb_id = cb.get("id")
     if chat_id is None:
+        return
+    # ── HARD BLOCK: only private chats ──
+    if chat.get("type") != "private":
         return
     lang = get_lang(chat_id)
 
@@ -1643,13 +1809,11 @@ def process_callback(cb):
         answer_callback(cb_id, "🚫 Banned")
         return
 
-    # ---- MAINTENANCE: block every button for regular users ----
     if MAINTENANCE_MODE and get_role(chat_id) == "user":
         answer_callback(cb_id)
         _send_maintenance(chat_id, lang)
         return
 
-    # ---- Language page nav ----
     if data.startswith("langpage:"):
         try:
             page = int(data.split(":", 1)[1])
@@ -1661,7 +1825,6 @@ def process_callback(cb):
         send_message(chat_id, t(lang, "choose_language"), language_keyboard(page))
         return
 
-    # ---- Language pick ----
     if data.startswith("lang:"):
         code = data.split(":", 1)[1]
         if code in LANGUAGES:
@@ -1682,7 +1845,6 @@ def process_callback(cb):
             _send_feature_menu(chat_id, code)
         return
 
-    # ---- Continue after join ----
     if data == "user:continue":
         ok, reason = check_user_joined(chat_id)
         if not ok:
@@ -1751,16 +1913,41 @@ def _ask_bot_setup(chat_id):
 
 
 def process_update(update):
+    # ── Auto-leave if user bot was added to a group / channel ──
+    if "my_chat_member" in update:
+        mcm = update["my_chat_member"]
+        chat = mcm.get("chat") or {}
+        if chat.get("type") != "private":
+            new_status = (mcm.get("new_chat_member") or {}).get("status")
+            if new_status in ("member", "administrator"):
+                cid = chat.get("id")
+                try:
+                    send_message(
+                        cid,
+                        "⚠️ This bot only works in <b>private chats</b>.\n"
+                        "Leaving this chat now — please DM me instead. 💬",
+                    )
+                except Exception:
+                    pass
+                leave_chat(cid)
+        return
+
     if "callback_query" in update:
         process_callback(update["callback_query"])
         return
     if "message" not in update:
         return
     msg = update["message"]
-    chat_id = msg.get("chat", {}).get("id")
-    user_id = msg.get("from", {}).get("id", chat_id)
+    chat = msg.get("chat", {}) or {}
+    chat_id = chat.get("id")
     if chat_id is None:
         return
+
+    # ── HARD BLOCK: only private chats ──
+    if chat.get("type") != "private":
+        return
+
+    user_id = msg.get("from", {}).get("id", chat_id)
 
     LAST_SEEN[chat_id] = time.time()
 
@@ -1772,18 +1959,15 @@ def process_update(update):
         return
     lang = get_lang(chat_id)
 
-    # ---- Banned ----
     if is_banned(chat_id):
         if text == "/start":
             send_message(chat_id, t(lang, "banned_msg"))
         return
 
-    # ---- MAINTENANCE: block EVERY message from regular users ----
     if MAINTENANCE_MODE and get_role(chat_id) == "user":
         _send_maintenance(chat_id, lang)
         return
 
-    # ---- /start ----
     if text == "/start":
         USER_STATE.pop(chat_id, None)
 
@@ -1813,12 +1997,10 @@ def process_update(update):
         _send_feature_menu(chat_id, lang)
         return
 
-    # ---- Support ----
     if text in ("/support", "/help_support") or is_button(text, "support_btn", lang):
         send_message(chat_id, t(lang, "support"))
         return
 
-    # ---- Language ----
     if text in ("/lang", "/language") or is_button(text, "lang_btn", lang):
         current = lang_label(lang)
         send_message(chat_id,
@@ -1826,7 +2008,6 @@ def process_update(update):
                      language_keyboard(0))
         return
 
-    # ---- Force-join gate ----
     if FORCE_JOIN_ENABLED and get_role(chat_id) == "user":
         ok, reason = check_user_joined(user_id)
         if not ok:
@@ -1837,13 +2018,11 @@ def process_update(update):
                 _ask_for_join(chat_id, lang)
             return
 
-    # ---- Cancel ----
     if text == "/cancel" or is_button(text, "cancel_btn", lang):
         USER_STATE.pop(chat_id, None)
         _send_feature_menu(chat_id, lang)
         return
 
-    # ---- OSINT query input ----
     state = USER_STATE.get(chat_id, {})
     if state.get("flow") == "api_query":
         api_name = state.get("api_name")
@@ -1863,7 +2042,6 @@ def process_update(update):
         USER_STATE.pop(chat_id, None)
         return
 
-    # ---- Command shortcuts ----
     if text.startswith("/"):
         parts = text.split(maxsplit=1)
         cmd = parts[0].lower()
@@ -1885,7 +2063,6 @@ def process_update(update):
                 send_message(chat_id, t(lang, "no_result"), main_keyboard(lang))
             return
 
-    # ---- Feature button ----
     api_name = next((name for name in API_CONFIG if name.strip() == text.strip()), None)
     if api_name is not None:
         cfg = API_CONFIG[api_name]
@@ -1956,7 +2133,7 @@ def _fmt_user_line(uid):
     ban = "🚫" if uid in BANNED_USERS else ""
     seen = LAST_SEEN.get(uid)
     seen_str = time.strftime("%m-%d %H:%M", time.localtime(seen)) if seen else "—"
-    return f"🆓{ban} <code>{uid}</code> · {lang} · seen {seen_str}"
+    return f"🆔{ban} <code>{uid}</code> · {lang} · seen {seen_str}"
 
 
 def _send_admin_panel(bot_number, chat_id, title=None):
@@ -1964,7 +2141,7 @@ def _send_admin_panel(bot_number, chat_id, title=None):
         bot_number, chat_id,
         title or ("🛠 <b>A D M I N   P A N E L</b>\n"
                   "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                  "👇 Choose an action below:"),
+                  "👮 Choose an action below:"),
         build_admin_main_keyboard(is_owner(chat_id)),
     )
 
@@ -2098,6 +2275,51 @@ def process_admin_callback(bot_number, cb):
             owner_system_keyboard(),
         )
         return
+
+    # ══════════ OWNER FILE MANAGER CALLBACKS ══════════
+    if data == "owner:files":
+        if not is_owner(chat_id):
+            admin_answer_callback(bot_number, cb_id, "⛔ Owner only")
+            return
+        admin_answer_callback(bot_number, cb_id)
+        admin_send_message(
+            bot_number, chat_id,
+            "🗂 <b>D A T A   F I L E S</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "👁 Tap a file to preview\n"
+            "📥 Tap the icon to download\n"
+            "📦 Or download all as ZIP\n\n"
+            "⚠️ <i>Owner-only. Contains sensitive data.</i>",
+            owner_files_keyboard(),
+        )
+        return
+
+    if data.startswith("owner:view:"):
+        if not is_owner(chat_id):
+            admin_answer_callback(bot_number, cb_id, "⛔ Owner only")
+            return
+        admin_answer_callback(bot_number, cb_id)
+        fname = data.split(":", 2)[2]
+        _owner_send_file_content(bot_number, chat_id, fname)
+        return
+
+    if data.startswith("owner:download:"):
+        if not is_owner(chat_id):
+            admin_answer_callback(bot_number, cb_id, "⛔ Owner only")
+            return
+        admin_answer_callback(bot_number, cb_id)
+        fname = data.split(":", 2)[2]
+        _owner_download_file(bot_number, chat_id, fname)
+        return
+
+    if data == "owner:download_all":
+        if not is_owner(chat_id):
+            admin_answer_callback(bot_number, cb_id, "⛔ Owner only")
+            return
+        admin_answer_callback(bot_number, cb_id)
+        _owner_download_all(bot_number, chat_id)
+        return
+    # ═══════════════════════════════════════════════════════
 
     if data == "owner:back":
         if not is_owner(chat_id):
@@ -2237,6 +2459,7 @@ def process_admin_command(bot_number, chat_id, text, message):
                            "/list · /stats · /online · /logs · /export\n\n"
                            "<b>Owner only</b>\n"
                            "/owner — Open Owner Panel\n"
+                           "/files — View / download all JSON data\n"
                            "/add_admin ID · /remove_admin ID\n"
                            "/setpassword NEW · /maintenance on|off\n\n"
                            "/whoami · /logout",
@@ -2253,6 +2476,21 @@ def process_admin_command(bot_number, chat_id, text, message):
                            "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                            "Sensitive controls for the bot owner.",
                            owner_panel_keyboard())
+        return
+
+    if cmd == "/files":
+        if not is_owner(chat_id):
+            admin_send_message(bot_number, chat_id, "⛔ Owner only.",
+                               build_admin_main_keyboard(is_owner(chat_id)))
+            return
+        admin_send_message(
+            bot_number, chat_id,
+            "🗂 <b>D A T A   F I L E S</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "👁 Preview any JSON below,\n"
+            "📥 or download the raw file.",
+            owner_files_keyboard(),
+        )
         return
 
     if cmd == "/whoami":
@@ -2557,6 +2795,23 @@ def process_admin_command(bot_number, chat_id, text, message):
 def process_admin_update(bot_number, update):
     global CURRENT_PASSWORD
 
+    # ── Auto-leave if admin bot added to a group / channel ──
+    if "my_chat_member" in update:
+        mcm = update["my_chat_member"]
+        chat = mcm.get("chat") or {}
+        if chat.get("type") != "private":
+            new_status = (mcm.get("new_chat_member") or {}).get("status")
+            if new_status in ("member", "administrator"):
+                leave_admin_chat(chat.get("id"))
+        return
+
+    # ── HARD BLOCK: only private chats ──
+    msg_for_type = (update.get("message") or
+                    (update.get("callback_query") or {}).get("message") or {})
+    chat_type = (msg_for_type.get("chat") or {}).get("type")
+    if chat_type and chat_type != "private":
+        return
+
     if "callback_query" in update:
         process_admin_callback(bot_number, update["callback_query"])
         return
@@ -2815,6 +3070,9 @@ def main():
     if not USER_BOT_TOKEN or "YOUR_USER_BOT_TOKEN" in USER_BOT_TOKEN:
         print("ERROR: USER_BOT_TOKEN missing.")
         return
+
+    # 🆕 Ensure all JSON files exist before loading them
+    ensure_json_files()
 
     load_password()
     load_admins()

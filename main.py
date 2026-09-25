@@ -67,10 +67,25 @@ def _env(name, default=""):
     return os.getenv(name, default).strip()
 
 
+# All persisted JSON data lives inside this folder
+DATA_DIR = _env("DATA_DIR", "data")
+try:
+    os.makedirs(DATA_DIR, exist_ok=True)
+except Exception as _e:
+    print(f"⚠️ Could not create data dir: {_e}")
+
+
+def _data_file(name):
+    return os.path.join(DATA_DIR, name)
+
+
 USER_BOT_TOKEN  = _env("USER_BOT_TOKEN",
                        "8771414496:AAEZYXZa3TXHPcJoEYxHmI105c60F8VSYxo")
 ADMIN_BOT_TOKEN = _env("ADMIN_BOT_TOKEN_1",
                        "8916442795:AAETD7lL1snL27ab0RVVzpMPBWvnJ7_Xyn4")
+
+# --- Leakosint API (used by Aadhaar, Number, PAN, Email) ---
+LEAKOSINT_API_KEY = _env("LEAKOSINT_API_KEY", "405696785:2gafVtDu")
 
 JOIN_CHANNEL_URL     = _env("JOIN_CHANNEL_URL", "https://t.me/Cyber_Warriors_22")
 JOIN_GROUP_URL       = _env("JOIN_GROUP_URL",   "https://t.me/Dark911_osint")
@@ -88,13 +103,16 @@ SELF_PING_INTERVAL = int(_env("SELF_PING_INTERVAL", "600"))
 SUPPORT_HANDLE = _env("SUPPORT_HANDLE", "@Tony_M_unlock")
 SUPPORT_URL    = _env("SUPPORT_URL",    "https://t.me/Tony_")
 
-ADMINS_FILE    = _env("ADMINS_FILE",    "admins.json")
-PASSWORD_FILE  = _env("PASSWORD_FILE",  "admin_password.json")
-BANNED_FILE    = _env("BANNED_FILE",    "banned.json")
-NOTES_FILE     = _env("NOTES_FILE",     "user_notes.json")
-ADMIN_LOG_FILE = _env("ADMIN_LOG_FILE", "admin_log.json")
-LASTSEEN_FILE  = _env("LASTSEEN_FILE",  "last_seen.json")
-LANGS_FILE     = _env("LANGS_FILE",     "user_langs.json")
+ADMINS_FILE         = _env("ADMINS_FILE",         _data_file("admins.json"))
+PASSWORD_FILE       = _env("PASSWORD_FILE",       _data_file("admin_password.json"))
+BANNED_FILE         = _env("BANNED_FILE",         _data_file("banned.json"))
+NOTES_FILE          = _env("NOTES_FILE",          _data_file("user_notes.json"))
+ADMIN_LOG_FILE      = _env("ADMIN_LOG_FILE",      _data_file("admin_log.json"))
+LASTSEEN_FILE       = _env("LASTSEEN_FILE",       _data_file("last_seen.json"))
+LANGS_FILE          = _env("LANGS_FILE",          _data_file("user_langs.json"))
+TOKENS_FILE         = _env("TOKENS_FILE",         _data_file("user_tokens.json"))
+REFS_FILE           = _env("REFS_FILE",           _data_file("user_refs.json"))
+LOGIN_ATTEMPTS_FILE = _env("LOGIN_ATTEMPTS_FILE", _data_file("login_attempts.json"))
 
 IMAGES = {
     "welcome":     _env("WELCOME_IMG",     "images/welcome.png"),
@@ -103,6 +121,27 @@ IMAGES = {
     "maintenance": _env("MAINTENANCE_IMG", "images/maintenance.png"),
 }
 IMAGE_CACHE = {}
+
+# ── Token system configuration ──
+# Economy:
+#   • 480 tokens on a full tank
+#   • 40 tokens per search  →  exactly 12 searches on a full tank
+#   • default regen = 3s/token (slow, ~24 min to refill from empty)
+#   • upgraded regen = 0.5s/token (6× faster, paid upgrade or 30 refs)
+TOKEN_CFG = {
+    "start_balance":     int(_env("TOKEN_START",          "480")),
+    "default_max":       int(_env("TOKEN_DEFAULT_MAX",    "480")),
+    "search_cost":       int(_env("TOKEN_SEARCH_COST",    "40")),
+    "default_regen_ms":  int(_env("TOKEN_REGEN_MS",       "3000")),
+    "upgraded_regen_ms": int(_env("TOKEN_UPGRADED_REGEN", "500")),
+    "max_upgrade_add":   int(_env("TOKEN_MAX_UPGRADE",    "500")),
+    "price_max_upgrade": int(_env("TOKEN_PRICE_MAX",      "50")),
+    "price_regen":       int(_env("TOKEN_PRICE_REGEN",    "40")),
+    "price_refill":      int(_env("TOKEN_PRICE_REFILL",   "5")),
+    "ref_milestone_instant": int(_env("REF_INSTANT_AT",   "2")),
+    "ref_milestone_regen":   int(_env("REF_REGEN_AT",     "30")),
+    "instant_minutes":       int(_env("REF_INSTANT_MIN",  "60")),
+}
 
 
 # ============================================================
@@ -120,6 +159,13 @@ ADMIN_LOG_MAX    = 500
 USER_STATE  = {}
 USER_LANGS  = {}
 ADMIN_STATE = {}
+
+USER_TOKENS = {}
+REF_INDEX   = {}
+
+LOGIN_ATTEMPTS = {}   # {chat_id: {"fails": int, "locked_until": float}}
+
+_BOT_USERNAME_CACHE = {"username": None}
 
 db_lock = threading.Lock()
 
@@ -139,7 +185,7 @@ HTTP       = _make_session(20, 50)
 ADMIN_HTTP = _make_session(10, 20)
 
 TG_CONNECT, TG_READ   = 5, 35
-API_CONNECT, API_READ = 3, 15
+API_CONNECT, API_READ = 5, 30   # bumped for slow APIs like Render / Netlify cold starts
 
 USER_TG_API   = f"https://api.telegram.org/bot{USER_BOT_TOKEN}"
 ADMIN_TG_APIS = {1: f"https://api.telegram.org/bot{ADMIN_BOT_TOKEN}"}
@@ -160,8 +206,10 @@ def _safe_load(path, default):
 
 
 def _safe_save(path, data):
-    """Write JSON compactly (no whitespace) — smaller file, faster I/O."""
     try:
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
         tmp = f"{path}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, separators=(",", ":"), ensure_ascii=False)
@@ -170,22 +218,22 @@ def _safe_save(path, data):
         print(f"⚠️ save {path} failed: {e}")
 
 
-# ============================================================
-# 5a. AUTO-CREATE JSON FILES (only if missing)
-# ============================================================
 _JSON_DEFAULTS = {
-    ADMINS_FILE:    [],
-    PASSWORD_FILE:  None,
-    BANNED_FILE:    {},
-    NOTES_FILE:     {},
-    ADMIN_LOG_FILE: [],
-    LASTSEEN_FILE:  {},
-    LANGS_FILE:     {},
+    ADMINS_FILE:         [],
+    PASSWORD_FILE:       None,
+    BANNED_FILE:         {},
+    NOTES_FILE:          {},
+    ADMIN_LOG_FILE:      [],
+    LASTSEEN_FILE:       {},
+    LANGS_FILE:          {},
+    TOKENS_FILE:         {},
+    REFS_FILE:           {},
+    LOGIN_ATTEMPTS_FILE: {},
 }
 
 
 def ensure_json_files():
-    """Create every JSON file with a sensible default if it doesn't exist."""
+    os.makedirs(DATA_DIR, exist_ok=True)
     for path, default in _JSON_DEFAULTS.items():
         if os.path.exists(path):
             continue
@@ -275,6 +323,72 @@ def save_langs():
         _safe_save(LANGS_FILE, {str(k): v for k, v in USER_LANGS.items()})
 
 
+def load_login_attempts():
+    global LOGIN_ATTEMPTS
+    raw = _safe_load(LOGIN_ATTEMPTS_FILE, {}) or {}
+    LOGIN_ATTEMPTS = {}
+    for k, v in raw.items():
+        if not str(k).lstrip("-").isdigit():
+            continue
+        LOGIN_ATTEMPTS[int(k)] = {
+            "fails":        int(v.get("fails", 0)),
+            "locked_until": float(v.get("locked_until", 0)),
+        }
+    print(f"🔐 Loaded {len(LOGIN_ATTEMPTS)} login-attempt record(s).")
+
+
+def save_login_attempts():
+    with db_lock:
+        _safe_save(LOGIN_ATTEMPTS_FILE,
+                   {str(k): v for k, v in LOGIN_ATTEMPTS.items()})
+
+
+# ── Login lockout policy ──
+LOCKOUT_SECONDS   = int(_env("LOGIN_LOCKOUT_SECONDS", "3600"))   # 1 hour
+LOCKOUT_MAX_FAILS = int(_env("LOGIN_MAX_FAILS",       "1"))      # 1 wrong → lock
+
+
+def _now():
+    return time.time()
+
+
+def login_lock_remaining(chat_id):
+    """Seconds remaining on the lockout, or 0 if not locked."""
+    rec = LOGIN_ATTEMPTS.get(chat_id)
+    if not rec:
+        return 0
+    rem = int(rec.get("locked_until", 0) - _now())
+    return rem if rem > 0 else 0
+
+
+def login_register_failure(chat_id):
+    """Record a failed attempt. Returns (locked_bool, seconds_locked)."""
+    rec = LOGIN_ATTEMPTS.setdefault(chat_id, {"fails": 0, "locked_until": 0.0})
+    rec["fails"] = int(rec.get("fails", 0)) + 1
+    if rec["fails"] >= LOCKOUT_MAX_FAILS:
+        rec["locked_until"] = _now() + LOCKOUT_SECONDS
+    save_login_attempts()
+    return rec["locked_until"] > _now(), max(0, int(rec["locked_until"] - _now()))
+
+
+def login_clear(chat_id):
+    """Reset the failure counter after a successful login."""
+    if chat_id in LOGIN_ATTEMPTS:
+        LOGIN_ATTEMPTS.pop(chat_id, None)
+        save_login_attempts()
+
+
+def _fmt_duration(seconds):
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m}m"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
 def log_admin(by, action, target=""):
     entry = {"ts": int(time.time()), "by": int(by),
              "action": str(action), "target": str(target)}
@@ -285,7 +399,186 @@ def log_admin(by, action, target=""):
 
 
 # ============================================================
-# 5b. OWNER JSON FILE MANAGER  (owner-only viewer + downloader)
+# 5c. TOKEN SYSTEM PERSISTENCE + LOGIC
+# ============================================================
+def load_tokens():
+    global USER_TOKENS, REF_INDEX
+    raw = _safe_load(TOKENS_FILE, {})
+    USER_TOKENS = {}
+    for k, v in (raw or {}).items():
+        if not str(k).lstrip("-").isdigit():
+            continue
+        USER_TOKENS[int(k)] = {
+            "tokens":         int(v.get("tokens", TOKEN_CFG["start_balance"])),
+            "max":            int(v.get("max", TOKEN_CFG["default_max"])),
+            "regen_ms":       int(v.get("regen_ms", TOKEN_CFG["default_regen_ms"])),
+            "last_ts":        float(v.get("last_ts", time.time())),
+            "refs":           int(v.get("refs", 0)),
+            "referred_by":    int(v.get("referred_by", 0) or 0),
+            "instant_until":  float(v.get("instant_until", 0)),
+            "regen_upgraded": bool(v.get("regen_upgraded", False)),
+            "max_upgraded":   bool(v.get("max_upgraded", False)),
+            "referred_users": list(v.get("referred_users", []) or []),
+        }
+
+    refs_raw = _safe_load(REFS_FILE, {})
+    REF_INDEX = {int(k): int(v) for k, v in (refs_raw or {}).items()
+                 if str(k).lstrip("-").isdigit() and str(v).lstrip("-").isdigit()}
+    print(f"🎟 Loaded {len(USER_TOKENS)} token records · {len(REF_INDEX)} refs")
+
+
+def save_tokens():
+    with db_lock:
+        out = {}
+        for uid, rec in USER_TOKENS.items():
+            out[str(uid)] = rec
+        _safe_save(TOKENS_FILE, out)
+        _safe_save(REFS_FILE, {str(k): v for k, v in REF_INDEX.items()})
+
+
+def _ensure_user_tokens(uid):
+    if uid not in USER_TOKENS:
+        USER_TOKENS[uid] = {
+            "tokens":         TOKEN_CFG["start_balance"],
+            "max":            TOKEN_CFG["default_max"],
+            "regen_ms":       TOKEN_CFG["default_regen_ms"],
+            "last_ts":        time.time(),
+            "refs":           0,
+            "referred_by":    0,
+            "instant_until":  0.0,
+            "regen_upgraded": False,
+            "max_upgraded":   False,
+            "referred_users": [],
+        }
+        return True
+    return False
+
+
+def tokens_apply_regen(uid):
+    _ensure_user_tokens(uid)
+    rec = USER_TOKENS[uid]
+    now = time.time()
+    if rec["tokens"] >= rec["max"]:
+        rec["last_ts"] = now
+        return rec["tokens"]
+    regen_ms = max(rec["regen_ms"], 100)
+    elapsed_ms = int((now - rec["last_ts"]) * 1000)
+    if elapsed_ms < regen_ms:
+        return rec["tokens"]
+    gained = elapsed_ms // regen_ms
+    if gained <= 0:
+        return rec["tokens"]
+    rec["tokens"] = min(rec["max"], rec["tokens"] + int(gained))
+    rec["last_ts"] = now
+    return rec["tokens"]
+
+
+def tokens_balance(uid):
+    return tokens_apply_regen(uid)
+
+
+def tokens_next_in_seconds(uid):
+    _ensure_user_tokens(uid)
+    rec = USER_TOKENS[uid]
+    if rec["tokens"] >= rec["max"]:
+        return 0
+    regen_ms = max(rec["regen_ms"], 100)
+    elapsed_ms = int((time.time() - rec["last_ts"]) * 1000)
+    remaining_ms = max(0, regen_ms - (elapsed_ms % regen_ms))
+    return max(1, remaining_ms // 1000 + (1 if remaining_ms % 1000 else 0))
+
+
+def tokens_has_instant(uid):
+    _ensure_user_tokens(uid)
+    return USER_TOKENS[uid]["instant_until"] > time.time()
+
+
+def tokens_instant_seconds_left(uid):
+    _ensure_user_tokens(uid)
+    return max(0, int(USER_TOKENS[uid]["instant_until"] - time.time()))
+
+
+def tokens_spend(uid, amount):
+    _ensure_user_tokens(uid)
+    if tokens_has_instant(uid):
+        return True, tokens_balance(uid), "instant"
+    bal = tokens_apply_regen(uid)
+    if bal < amount:
+        save_tokens()
+        return False, bal, "insufficient"
+    USER_TOKENS[uid]["tokens"] = bal - amount
+    save_tokens()
+    return True, USER_TOKENS[uid]["tokens"], "ok"
+
+
+def tokens_add(uid, amount):
+    _ensure_user_tokens(uid)
+    rec = USER_TOKENS[uid]
+    rec["tokens"] = min(rec["max"], rec["tokens"] + amount)
+    save_tokens()
+    return rec["tokens"]
+
+
+def tokens_extend_max(uid, extra):
+    _ensure_user_tokens(uid)
+    rec = USER_TOKENS[uid]
+    rec["max"] += extra
+    rec["max_upgraded"] = True
+    rec["tokens"] = min(rec["max"], rec["tokens"] + extra)
+    save_tokens()
+    return rec["max"]
+
+
+def tokens_upgrade_regen(uid):
+    _ensure_user_tokens(uid)
+    rec = USER_TOKENS[uid]
+    if rec["regen_upgraded"]:
+        return False, rec["regen_ms"]
+    rec["regen_ms"] = TOKEN_CFG["upgraded_regen_ms"]
+    rec["regen_upgraded"] = True
+    save_tokens()
+    return True, rec["regen_ms"]
+
+
+def tokens_grant_instant(uid, minutes):
+    _ensure_user_tokens(uid)
+    rec = USER_TOKENS[uid]
+    rec["instant_until"] = max(rec["instant_until"], time.time()) + minutes * 60
+    save_tokens()
+    return rec["instant_until"]
+
+
+def refs_register(new_uid, referrer_uid):
+    if new_uid == referrer_uid:
+        return False, 0, None
+    if not referrer_uid or not str(referrer_uid).lstrip("-").isdigit():
+        return False, 0, None
+    if new_uid in REF_INDEX:
+        return False, 0, None
+    _ensure_user_tokens(new_uid)
+    _ensure_user_tokens(referrer_uid)
+
+    REF_INDEX[new_uid] = referrer_uid
+    USER_TOKENS[new_uid]["referred_by"] = referrer_uid
+    rec = USER_TOKENS[referrer_uid]
+    if new_uid not in rec["referred_users"]:
+        rec["referred_users"].append(new_uid)
+        rec["refs"] = len(rec["referred_users"])
+
+    milestone = None
+    if rec["refs"] >= TOKEN_CFG["ref_milestone_instant"] and rec["instant_until"] <= time.time():
+        tokens_grant_instant(referrer_uid, TOKEN_CFG["instant_minutes"])
+        milestone = f"instant_{TOKEN_CFG['instant_minutes']}min"
+    if rec["refs"] >= TOKEN_CFG["ref_milestone_regen"] and not rec["regen_upgraded"]:
+        tokens_upgrade_regen(referrer_uid)
+        milestone = "regen_upgrade"
+
+    save_tokens()
+    return True, rec["refs"], milestone
+
+
+# ============================================================
+# 5b. OWNER JSON FILE MANAGER
 # ============================================================
 JSON_FILE_MAP = {
     "admins.json":         ADMINS_FILE,
@@ -295,6 +588,9 @@ JSON_FILE_MAP = {
     "admin_log.json":      ADMIN_LOG_FILE,
     "last_seen.json":      LASTSEEN_FILE,
     "user_langs.json":     LANGS_FILE,
+    "user_tokens.json":    TOKENS_FILE,
+    "user_refs.json":      REFS_FILE,
+    "login_attempts.json": LOGIN_ATTEMPTS_FILE,
 }
 
 
@@ -317,13 +613,11 @@ def _escape_html(s: str) -> str:
 def _owner_send_file_content(bot_number, chat_id, fname):
     path = JSON_FILE_MAP.get(fname)
     if not path:
-        admin_send_message(bot_number, chat_id, "❌ Unknown file.",
-                           owner_files_keyboard())
+        admin_send_message(bot_number, chat_id, "❌ Unknown file.", owner_files_keyboard())
         return
     if not os.path.exists(path):
         admin_send_message(bot_number, chat_id,
-                           f"❌ File not found: <code>{fname}</code>",
-                           owner_files_keyboard())
+                           f"❌ File not found: <code>{fname}</code>", owner_files_keyboard())
         return
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -333,31 +627,27 @@ def _owner_send_file_content(bot_number, chat_id, fname):
         except Exception:
             pretty = raw
     except Exception as e:
-        admin_send_message(bot_number, chat_id, f"❌ Read failed: {e}",
-                           owner_files_keyboard())
+        admin_send_message(bot_number, chat_id, f"❌ Read failed: {e}", owner_files_keyboard())
         return
 
     header = f"📄 <b>{fname}</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n"
     body = _escape_html(pretty)
     chunk = 3500
     if len(body) <= chunk:
-        admin_send_message(bot_number, chat_id,
-                           header + f"<pre>{body}</pre>",
+        admin_send_message(bot_number, chat_id, header + f"<pre>{body}</pre>",
                            owner_files_keyboard())
         return
     admin_send_message(bot_number, chat_id, header + "<i>(truncated preview)</i>")
     for i in range(0, len(body), chunk):
         admin_send_message(bot_number, chat_id, f"<pre>{body[i:i + chunk]}</pre>")
-    admin_send_message(bot_number, chat_id, "✅ End of preview.",
-                       owner_files_keyboard())
+    admin_send_message(bot_number, chat_id, "✅ End of preview.", owner_files_keyboard())
 
 
 def _owner_download_file(bot_number, chat_id, fname):
     path = JSON_FILE_MAP.get(fname)
     if not path or not os.path.exists(path):
         admin_send_message(bot_number, chat_id,
-                           f"❌ File not found: <code>{fname}</code>",
-                           owner_files_keyboard())
+                           f"❌ File not found: <code>{fname}</code>", owner_files_keyboard())
         return
     try:
         url = f"{ADMIN_TG_APIS[bot_number]}/sendDocument"
@@ -389,8 +679,7 @@ def _owner_download_all(bot_number, chat_id):
                             files={"document": ("all_data.zip", f, "application/zip")},
                             timeout=(10, 60))
     except Exception as e:
-        admin_send_message(bot_number, chat_id, f"❌ ZIP failed: {e}",
-                           owner_files_keyboard())
+        admin_send_message(bot_number, chat_id, f"❌ ZIP failed: {e}", owner_files_keyboard())
 
 
 # ============================================================
@@ -449,75 +738,36 @@ for _p in IMAGES.values():
 
 
 # ============================================================
-# 8. i18n — ALL 32 languages with native names
+# 8. i18n — ALL 32 languages
 # ============================================================
 LANGUAGES = {
-    "en": "🇬🇧 English",
-    "hi": "🇮🇳 हिन्दी",
-    "bn": "🇧🇩 বাংলা",
-    "ur": "🇵🇰 اردو",
-    "ar": "🇸🇦 العربية",
-    "es": "🇪🇸 Español",
-    "fr": "🇫🇷 Français",
-    "de": "🇩🇪 Deutsch",
-    "pt": "🇧🇷 Português",
-    "ru": "🇷🇺 Русский",
-    "zh": "🇨🇳 中文",
-    "ja": "🇯🇵 日本語",
-    "ko": "🇰🇷 한국어",
-    "id": "🇮🇩 Indonesia",
-    "tr": "🇹🇷 Türkçe",
-    "fa": "🇮🇷 فارسی",
-    "it": "🇮🇹 Italiano",
-    "vi": "🇻🇳 Tiếng Việt",
-    "th": "🇹🇭 ไทย",
-    "ta": "🇮🇳 தமிழ்",
-    "te": "🇮🇳 తెలుగు",
-    "mr": "🇮🇳 मराठी",
-    "gu": "🇮🇳 ગુજરાતી",
-    "pa": "🇮🇳 ਪੰਜਾਬੀ",
-    "ml": "🇮🇳 മലയാളം",
-    "nl": "🇳🇱 Nederlands",
-    "pl": "🇵🇱 Polski",
-    "uk": "🇺🇦 Українська",
-    "ro": "🇷🇴 Română",
-    "sw": "🇰🇪 Kiswahili",
-    "ms": "🇲🇾 Bahasa Melayu",
-    "fil": "🇵🇭 Filipino",
+    "en": "🇬🇧 English", "hi": "🇮🇳 हिन्दी", "bn": "🇧🇩 বাংলা", "ur": "🇵🇰 اردو",
+    "ar": "🇸🇦 العربية", "es": "🇪🇸 Español", "fr": "🇫🇷 Français", "de": "🇩🇪 Deutsch",
+    "pt": "🇧🇷 Português", "ru": "🇷🇺 Русский", "zh": "🇨🇳 中文", "ja": "🇯🇵 日本語",
+    "ko": "🇰🇷 한국어", "id": "🇮🇩 Indonesia", "tr": "🇹🇷 Türkçe", "fa": "🇮🇷 فارسی",
+    "it": "🇮🇹 Italiano", "vi": "🇻🇳 Tiếng Việt", "th": "🇹🇭 ไทย", "ta": "🇮🇳 தமிழ்",
+    "te": "🇮🇳 తెలుగు", "mr": "🇮🇳 मराठी", "gu": "🇮🇳 ગુજરાતી", "pa": "🇮🇳 ਪੰਜਾਬੀ",
+    "ml": "🇮🇳 മലയാളം", "nl": "🇳🇱 Nederlands", "pl": "🇵🇱 Polski", "uk": "🇺🇦 Українська",
+    "ro": "🇷🇴 Română", "sw": "🇰🇪 Kiswahili", "ms": "🇲🇾 Bahasa Melayu", "fil": "🇵🇭 Filipino",
 }
 
 _LANG_ALIASES = {
-    "en": "en", "en-us": "en", "en-gb": "en",
-    "hi": "hi", "hi-in": "hi",
-    "bn": "bn", "bn-bd": "bn", "bn-in": "bn",
-    "ur": "ur", "ur-pk": "ur",
-    "ar": "ar", "ar-sa": "ar", "ar-eg": "ar",
-    "es": "es", "es-es": "es", "es-mx": "es",
-    "fr": "fr", "fr-fr": "fr",
-    "de": "de", "de-de": "de",
-    "pt": "pt", "pt-br": "pt", "pt-pt": "pt",
-    "ru": "ru", "ru-ru": "ru",
+    "en": "en", "en-us": "en", "en-gb": "en", "hi": "hi", "hi-in": "hi",
+    "bn": "bn", "bn-bd": "bn", "bn-in": "bn", "ur": "ur", "ur-pk": "ur",
+    "ar": "ar", "ar-sa": "ar", "ar-eg": "ar", "es": "es", "es-es": "es", "es-mx": "es",
+    "fr": "fr", "fr-fr": "fr", "de": "de", "de-de": "de",
+    "pt": "pt", "pt-br": "pt", "pt-pt": "pt", "ru": "ru", "ru-ru": "ru",
     "zh": "zh", "zh-cn": "zh", "zh-hans": "zh", "zh-tw": "zh", "zh-hant": "zh",
-    "ja": "ja", "ja-jp": "ja",
-    "ko": "ko", "ko-kr": "ko",
-    "id": "id", "id-id": "id", "in": "id",
-    "tr": "tr", "tr-tr": "tr",
-    "fa": "fa", "fa-ir": "fa",
-    "it": "it", "it-it": "it",
-    "vi": "vi", "vi-vn": "vi",
-    "th": "th", "th-th": "th",
-    "ta": "ta", "ta-in": "ta",
-    "te": "te", "te-in": "te",
-    "mr": "mr", "mr-in": "mr",
-    "gu": "gu", "gu-in": "gu",
-    "pa": "pa", "pa-in": "pa",
-    "ml": "ml", "ml-in": "ml",
-    "nl": "nl", "nl-nl": "nl",
-    "pl": "pl", "pl-pl": "pl",
-    "uk": "uk", "uk-ua": "uk",
-    "ro": "ro", "ro-ro": "ro",
-    "sw": "sw", "sw-ke": "sw",
-    "ms": "ms", "ms-my": "ms",
+    "ja": "ja", "ja-jp": "ja", "ko": "ko", "ko-kr": "ko",
+    "id": "id", "id-id": "id", "in": "id", "tr": "tr", "tr-tr": "tr",
+    "fa": "fa", "fa-ir": "fa", "it": "it", "it-it": "it",
+    "vi": "vi", "vi-vn": "vi", "th": "th", "th-th": "th",
+    "ta": "ta", "ta-in": "ta", "te": "te", "te-in": "te",
+    "mr": "mr", "mr-in": "mr", "gu": "gu", "gu-in": "gu",
+    "pa": "pa", "pa-in": "pa", "ml": "ml", "ml-in": "ml",
+    "nl": "nl", "nl-nl": "nl", "pl": "pl", "pl-pl": "pl",
+    "uk": "uk", "uk-ua": "uk", "ro": "ro", "ro-ro": "ro",
+    "sw": "sw", "sw-ke": "sw", "ms": "ms", "ms-my": "ms",
     "fil": "fil", "tl": "fil",
 }
 
@@ -539,11 +789,21 @@ TEXTS = {
         "send_cancel": "💡 <i>Send /cancel to cancel anytime.</i>",
         "searching": "🔎 <i>Searching...</i>",
         "no_result": "❌ No result or API error occurred.",
+        "feature_unavailable": (
+            "🚧 <b>F E A T U R E   C O M I N G   S O O N</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "⚠️ This feature is <b>not available</b> right now.\n"
+            "It is either under development or temporarily disabled.\n\n"
+            "🔔 Please check back later!\n\n"
+            "💬 <b>Support:</b> @Tony_M_unlock"
+        ),
         "select_option": "❓ Please select an option from the menu.",
         "back": "🔙 Back",
         "cancel_btn": "❌ Cancel",
         "lang_btn": "🌐 Language",
         "support_btn": "💬 Support",
+        "tokens_btn": "🪙 Tokens",
+        "refer_btn": "🎁 Refer",
         "continue_btn": "✅ Continue",
         "join_required": ("🔒 <b>MEMBERSHIP REQUIRED</b>\n"
                           "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -563,757 +823,14 @@ TEXTS = {
                        "Your account has been suspended."),
         "current_lang": "🌐 Current language: <b>{name}</b>",
     },
-    "hi": {
-        "welcome": ("✨ <b>स्वागत है</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    "🤖 <b>फ्री OSINT बॉट</b>\n📓 सभी इंटेलिजेंस टूल्स अनलॉक\n"
-                    "⚡ तेज़  •  🔒 सुरक्षित  •  🎯 विश्वसनीय\n\n"
-                    "💬 <b>सपोर्ट:</b> @Tony_M_unlock"),
-        "select_feature": ("🛠 <b>मुख्य मेनू</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                           "👮 <b>शुरू करने के लिए एक सुविधा चुनें:</b>\n\n"
-                           "💬 <b>सपोर्ट:</b> @Tony_M_unlock"),
-        "support": "💬 <b>सपोर्ट:</b> @Tony_M_unlock",
-        "cancelled": "❌ <b>रद्द किया गया।</b>",
-        "choose_language": "🌐 <b>कृपया अपनी भाषा चुनें:</b>",
-        "language_set": "✅ भाषा सफलतापूर्वक अपडेट हो गई।",
-        "send_cancel": "💡 <i>रद्द करने के लिए /cancel भेजें।</i>",
-        "searching": "🔎 <i>खोज रहे हैं...</i>",
-        "no_result": "❌ कोई परिणाम नहीं या API त्रुटि।",
-        "select_option": "❓ कृपया मेनू से एक विकल्प चुनें।",
-        "back": "🔙 वापस",
-        "cancel_btn": "❌ रद्द करें",
-        "lang_btn": "🌐 भाषा",
-        "support_btn": "💬 सपोर्ट",
-        "continue_btn": "✅ जारी रखें",
-        "join_required": ("🔒 <b>सदस्यता आवश्यक</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                          "बॉट का उपयोग करने के लिए कृपया चैनल और ग्रुप जॉइन करें।\n\n"
-                          "फिर <b>✅ जारी रखें</b> पर टैप करें।\n\n"
-                          "💬 <b>सपोर्ट:</b> @Tony_M_unlock"),
-        "join_ok": "✅ सदस्यता सत्यापित। स्वागत है!",
-        "join_fail": "❌ पहले चैनल और ग्रुप दोनों जॉइन करें।",
-        "maintenance": ("🛠 <b>रखरखाव जारी</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                        "⚠️ बॉट अनुसूचित रखरखाव के लिए\n"
-                        "अस्थायी रूप से <b>ऑफ़लाइन</b> है।\n\n"
-                        "🕒 कृपया थोड़ी देर बाद पुनः प्रयास करें।\n\n"
-                        "💬 <b>सपोर्ट:</b> @Tony_M_unlock"),
-        "banned_msg": ("🚫 <b>पहुंच अवरुद्ध</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                       "आपका खाता निलंबित कर दिया गया है।"),
-        "current_lang": "🌐 वर्तमान भाषा: <b>{name}</b>",
-    },
-    "bn": {
-        "welcome": ("✨ <b>স্বাগতম</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    "🤖 <b>ফ্রি OSINT বট</b>\n📓 সমস্ত ইন্টেলিজেন্স টুল আনলক\n"
-                    "⚡ দ্রুত  •  🔒 নিরাপদ  •  🎯 নির্ভরযোগ্য\n\n"
-                    "💬 <b>সাপোর্ট:</b> @Tony_M_unlock"),
-        "select_feature": ("🛠 <b>প্রধান মেনু</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                           "👮 <b>শুরু করতে একটি ফিচার নির্বাচন করুন:</b>\n\n"
-                           "💬 <b>সাপোর্ট:</b> @Tony_M_unlock"),
-        "support": "💬 <b>সাপোর্ট:</b> @Tony_M_unlock",
-        "cancelled": "❌ <b>বাতিল হয়েছে।</b>",
-        "choose_language": "🌐 <b>অনুগ্রহ করে আপনার ভাষা নির্বাচন করুন:</b>",
-        "language_set": "✅ ভাষা সফলভাবে আপডেট হয়েছে।",
-        "send_cancel": "💡 <i>বাতিল করতে /cancel পাঠান।</i>",
-        "searching": "🔎 <i>খোঁজা হচ্ছে...</i>",
-        "no_result": "❌ কোনো ফলাফল নেই বা API ত্রুটি।",
-        "select_option": "❓ মেনু থেকে একটি অপশন নির্বাচন করুন।",
-        "back": "🔙 ফিরে যান",
-        "cancel_btn": "❌ বাতিল",
-        "lang_btn": "🌐 ভাষা",
-        "support_btn": "💬 সাপোর্ট",
-        "continue_btn": "✅ চালিয়ে যান",
-        "join_required": ("🔒 <b>সদস্যপদ প্রয়োজন</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                          "এই বট ব্যবহার করতে চ্যানেল ও গ্রুপ জয়েন করুন।\n\n"
-                          "এরপর <b>✅ চালিয়ে যান</b> চাপুন।\n\n"
-                          "💬 <b>সাপোর্ট:</b> @Tony_M_unlock"),
-        "join_ok": "✅ সদস্যপদ যাচাই হয়েছে। স্বাগতম!",
-        "join_fail": "❌ প্রথমে চ্যানেল ও গ্রুপ উভয়েই জয়েন করুন।",
-        "maintenance": ("🛠 <b>রক্ষণাবেক্ষণ চলছে</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                        "⚠️ বট নির্ধারিত রক্ষণাবেক্ষণের জন্য\n"
-                        "সাময়িকভাবে <b>অফলাইন</b>।\n\n"
-                        "🕒 অনুগ্রহ করে কিছুক্ষণ পরে আবার চেষ্টা করুন।\n\n"
-                        "💬 <b>সাপোর্ট:</b> @Tony_M_unlock"),
-        "banned_msg": ("🚫 <b>প্রবেশ অবরুদ্ধ</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                       "আপনার অ্যাকাউন্ট স্থগিত করা হয়েছে।"),
-        "current_lang": "🌐 বর্তমান ভাষা: <b>{name}</b>",
-    },
-    "ur": {
-        "welcome": ("✨ <b>خوش آمدید</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    "🤖 <b>مفت OSINT بوٹ</b>\n📓 تمام انٹیلیجنس ٹولز غیر مقفل\n"
-                    "⚡ تیز  •  🔒 محفوظ  •  🎯 قابل اعتماد\n\n"
-                    "💬 <b>سپورٹ:</b> @Tony_M_unlock"),
-        "select_feature": ("🛠 <b>مرکزی مینو</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                           "👮 <b>شروع کرنے کے لیے ایک فیچر منتخب کریں:</b>\n\n"
-                           "💬 <b>سپورٹ:</b> @Tony_M_unlock"),
-        "support": "💬 <b>سپورٹ:</b> @Tony_M_unlock",
-        "cancelled": "❌ <b>منسوخ کر دیا گیا۔</b>",
-        "choose_language": "🌐 <b>براہ کرم اپنی زبان منتخب کریں:</b>",
-        "language_set": "✅ زبان کامیابی سے اپ ڈیٹ ہو گئی۔",
-        "send_cancel": "💡 <i>منسوخ کرنے کے لیے /cancel بھیجیں۔</i>",
-        "searching": "🔎 <i>تلاش جاری ہے...</i>",
-        "no_result": "❌ کوئی نتیجہ نہیں یا API خرابی۔",
-        "select_option": "❓ براہ کرم مینو سے ایک آپشن منتخب کریں۔",
-        "back": "🔙 واپس",
-        "cancel_btn": "❌ منسوخ",
-        "lang_btn": "🌐 زبان",
-        "support_btn": "💬 سپورٹ",
-        "continue_btn": "✅ جاری رکھیں",
-        "join_required": ("🔒 <b>رکنیت درکار ہے</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                          "اس بوٹ کو استعمال کرنے کے لیے چینل اور گروپ جوائن کریں۔\n\n"
-                          "جوائن کے بعد <b>✅ جاری رکھیں</b> پر ٹیپ کریں۔\n\n"
-                          "💬 <b>سپورٹ:</b> @Tony_M_unlock"),
-        "join_ok": "✅ رکنیت کی تصدیق ہو گئی۔ خوش آمدید!",
-        "join_fail": "❌ پہلے چینل اور گروپ دونوں جوائن کریں۔",
-        "maintenance": ("🛠 <b>دیکھ بھال جاری ہے</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                        "⚠️ بوٹ مقررہ دیکھ بھال کے لیے\n"
-                        "عارضی طور پر <b>آف لائن</b> ہے۔\n\n"
-                        "🕒 براہ کرم تھوڑی دیر بعد دوبارہ کوشش کریں۔\n\n"
-                        "💬 <b>سپورٹ:</b> @Tony_M_unlock"),
-        "banned_msg": ("🚫 <b>رسائی بلاک</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                       "آپ کا اکاؤنٹ معطل کر دیا گیا ہے۔"),
-        "current_lang": "🌐 موجودہ زبان: <b>{name}</b>",
-    },
-    "ar": {
-        "welcome": ("✨ <b>مرحباً</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    "🤖 <b>بوت OSINT مجاني</b>\n📓 جميع أدوات الاستخبارات مفتوحة\n"
-                    "⚡ سريع  •  🔒 آمن  •  🎯 موثوق\n\n"
-                    "💬 <b>الدعم:</b> @Tony_M_unlock"),
-        "select_feature": ("🛠 <b>القائمة الرئيسية</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                           "👮 <b>اختر ميزة للبدء:</b>\n\n💬 <b>الدعم:</b> @Tony_M_unlock"),
-        "support": "💬 <b>الدعم:</b> @Tony_M_unlock",
-        "cancelled": "❌ <b>تم الإلغاء.</b>",
-        "choose_language": "🌐 <b>الرجاء اختيار لغتك:</b>",
-        "language_set": "✅ تم تحديث اللغة بنجاح.",
-        "send_cancel": "💡 <i>أرسل /cancel للإلغاء.</i>",
-        "searching": "🔎 <i>جاري البحث...</i>",
-        "no_result": "❌ لا توجد نتيجة أو حدث خطأ في API.",
-        "select_option": "❓ الرجاء اختيار خيار من القائمة.",
-        "back": "🔙 رجوع",
-        "cancel_btn": "❌ إلغاء",
-        "lang_btn": "🌐 اللغة",
-        "support_btn": "💬 الدعم",
-        "continue_btn": "✅ متابعة",
-        "join_required": ("🔒 <b>العضوية مطلوبة</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                          "يجب الانضمام إلى القناة والمجموعة لاستخدام هذا البوت.\n\n"
-                          "بعد الانضمام اضغط <b>✅ متابعة</b>.\n\n"
-                          "💬 <b>الدعم:</b> @Tony_M_unlock"),
-        "join_ok": "✅ تم التحقق من العضوية. مرحباً!",
-        "join_fail": "❌ يجب الانضمام إلى القناة والمجموعة أولاً.",
-        "maintenance": ("🛠 <b>تحت الصيانة</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                        "⚠️ البوت <b>غير متصل</b> مؤقتاً\n"
-                        "لأعمال صيانة مجدولة.\n\n"
-                        "🕒 يرجى المحاولة مرة أخرى بعد قليل.\n\n"
-                        "💬 <b>الدعم:</b> @Tony_M_unlock"),
-        "banned_msg": ("🚫 <b>تم حظر الوصول</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                       "تم تعليق حسابك."),
-        "current_lang": "🌐 اللغة الحالية: <b>{name}</b>",
-    },
-    "es": {
-        "welcome": ("✨ <b>B I E N V E N I D O</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    "🤖 <b>Bot OSINT Gratuito</b>\n📓 Todas las herramientas desbloqueadas\n"
-                    "⚡ Rápido  •  🔒 Seguro  •  🎯 Confiable\n\n"
-                    "💬 <b>Soporte:</b> @Tony_M_unlock"),
-        "select_feature": ("🛠 <b>M E N Ú   P R I N C I P A L</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                           "👮 <b>Selecciona una función:</b>\n\n💬 <b>Soporte:</b> @Tony_M_unlock"),
-        "support": "💬 <b>Soporte:</b> @Tony_M_unlock",
-        "cancelled": "❌ <b>Cancelado.</b>",
-        "choose_language": "🌐 <b>Por favor elige tu idioma:</b>",
-        "language_set": "✅ Idioma actualizado correctamente.",
-        "send_cancel": "💡 <i>Envía /cancel para cancelar.</i>",
-        "searching": "🔎 <i>Buscando...</i>",
-        "no_result": "❌ No hay resultados o error en la API.",
-        "select_option": "❓ Selecciona una opción del menú.",
-        "back": "🔙 Atrás",
-        "cancel_btn": "❌ Cancelar",
-        "lang_btn": "🌐 Idioma",
-        "support_btn": "💬 Soporte",
-        "continue_btn": "✅ Continuar",
-        "join_required": ("🔒 <b>SE REQUIERE MEMBRESÍA</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                          "Debes unirte a nuestro canal y grupo para usar este bot.\n\n"
-                          "Después pulsa <b>✅ Continuar</b>.\n\n"
-                          "💬 <b>Soporte:</b> @Tony_M_unlock"),
-        "join_ok": "✅ Membresías verificadas. ¡Bienvenido!",
-        "join_fail": "❌ Primero debes unirte al canal y al grupo.",
-        "maintenance": ("🛠 <b>E N   M A N T E N I M I E N T O</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                        "⚠️ El bot está <b>fuera de línea</b> temporalmente\n"
-                        "por mantenimiento programado.\n\n"
-                        "🕒 Inténtalo de nuevo en un momento.\n\n"
-                        "💬 <b>Soporte:</b> @Tony_M_unlock"),
-        "banned_msg": ("🚫 <b>ACCESO BLOQUEADO</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                       "Tu cuenta ha sido suspendida."),
-        "current_lang": "🌐 Idioma actual: <b>{name}</b>",
-    },
-    "fr": {
-        "welcome": ("✨ <b>B I E N V E N U E</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    "🤖 <b>Bot OSINT Gratuit</b>\n📓 Tous les outils débloqués\n"
-                    "⚡ Rapide  •  🔒 Sécurisé  •  🎯 Fiable\n\n"
-                    "💬 <b>Support:</b> @Tony_M_unlock"),
-        "select_feature": ("🛠 <b>M E N U   P R I N C I P A L</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                           "👮 <b>Sélectionnez une fonctionnalité:</b>\n\n💬 <b>Support:</b> @Tony_M_unlock"),
-        "support": "💬 <b>Support:</b> @Tony_M_unlock",
-        "cancelled": "❌ <b>Annulé.</b>",
-        "choose_language": "🌐 <b>Veuillez choisir votre langue:</b>",
-        "language_set": "✅ Langue mise à jour avec succès.",
-        "send_cancel": "💡 <i>Envoyez /cancel pour annuler.</i>",
-        "searching": "🔎 <i>Recherche...</i>",
-        "no_result": "❌ Aucun résultat ou erreur API.",
-        "select_option": "❓ Veuillez sélectionner une option.",
-        "back": "🔙 Retour",
-        "cancel_btn": "❌ Annuler",
-        "lang_btn": "🌐 Langue",
-        "support_btn": "💬 Support",
-        "continue_btn": "✅ Continuer",
-        "join_required": ("🔒 <b>ADHÉSION REQUISE</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                          "Rejoignez notre chaîne et groupe pour utiliser ce bot.\n\n"
-                          "Puis appuyez sur <b>✅ Continuer</b>.\n\n"
-                          "💬 <b>Support:</b> @Tony_M_unlock"),
-        "join_ok": "✅ Adhésions vérifiées. Bienvenue!",
-        "join_fail": "❌ Rejoignez d'abord la chaîne et le groupe.",
-        "maintenance": ("🛠 <b>E N   M A I N T E N A N C E</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                        "⚠️ Le bot est temporairement <b>hors ligne</b>\n"
-                        "pour maintenance programmée.\n\n"
-                        "🕒 Réessayez dans quelques instants.\n\n"
-                        "💬 <b>Support:</b> @Tony_M_unlock"),
-        "banned_msg": ("🚫 <b>ACCÈS BLOQUÉ</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                       "Votre compte a été suspendu."),
-        "current_lang": "🌐 Langue actuelle: <b>{name}</b>",
-    },
-    "ru": {
-        "welcome": ("✨ <b>Д О Б Р О   П О Ж А Л О В А Т Ь</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    "🤖 <b>Бесплатный OSINT-бот</b>\n📓 Все инструменты разблокированы\n"
-                    "⚡ Быстро  •  🔒 Безопасно  •  🎯 Надёжно\n\n"
-                    "💬 <b>Поддержка:</b> @Tony_M_unlock"),
-        "select_feature": ("🛠 <b>Г Л А В Н О Е   М Е Н Ю</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                           "👮 <b>Выберите функцию:</b>\n\n💬 <b>Поддержка:</b> @Tony_M_unlock"),
-        "support": "💬 <b>Поддержка:</b> @Tony_M_unlock",
-        "cancelled": "❌ <b>Отменено.</b>",
-        "choose_language": "🌐 <b>Выберите язык:</b>",
-        "language_set": "✅ Язык успешно обновлён.",
-        "send_cancel": "💡 <i>Отправьте /cancel чтобы отменить.</i>",
-        "searching": "🔎 <i>Поиск...</i>",
-        "no_result": "❌ Нет результатов или ошибка API.",
-        "select_option": "❓ Выберите пункт из меню.",
-        "back": "🔙 Назад",
-        "cancel_btn": "❌ Отмена",
-        "lang_btn": "🌐 Язык",
-        "support_btn": "💬 Поддержка",
-        "continue_btn": "✅ Продолжить",
-        "join_required": ("🔒 <b>ТРЕБУЕТСЯ ПОДПИСКА</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                          "Присоединитесь к каналу и группе чтобы использовать бота.\n\n"
-                          "После нажмите <b>✅ Продолжить</b>.\n\n"
-                          "💬 <b>Поддержка:</b> @Tony_M_unlock"),
-        "join_ok": "✅ Подписки подтверждены. Добро пожаловать!",
-        "join_fail": "❌ Сначала присоединитесь к каналу и группе.",
-        "maintenance": ("🛠 <b>Т Е Х Н И Ч Е С К О Е   О Б С Л У Ж И В А Н И Е</b>\n"
-                        "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                        "⚠️ Бот временно <b>недоступен</b>\n"
-                        "по причине планового обслуживания.\n\n"
-                        "🕒 Попробуйте ещё раз через несколько минут.\n\n"
-                        "💬 <b>Поддержка:</b> @Tony_M_unlock"),
-        "banned_msg": ("🚫 <b>ДОСТУП ЗАБЛОКИРОВАН</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                       "Ваш аккаунт заблокирован."),
-        "current_lang": "🌐 Текущий язык: <b>{name}</b>",
-    },
-    "pt": {
-        "welcome": ("✨ <b>B E M - V I N D O</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    "🤖 <b>Bot OSINT Gratuito</b>\n📓 Todas as ferramentas desbloqueadas\n"
-                    "⚡ Rápido  •  🔒 Seguro  •  🎯 Confiável\n\n"
-                    "💬 <b>Suporte:</b> @Tony_M_unlock"),
-        "select_feature": ("🛠 <b>M E N U   P R I N C I P A L</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                           "👮 <b>Selecione um recurso:</b>\n\n💬 <b>Suporte:</b> @Tony_M_unlock"),
-        "support": "💬 <b>Suporte:</b> @Tony_M_unlock",
-        "cancelled": "❌ <b>Cancelado.</b>",
-        "choose_language": "🌐 <b>Escolha seu idioma:</b>",
-        "language_set": "✅ Idioma atualizado com sucesso.",
-        "send_cancel": "💡 <i>Envie /cancel para cancelar.</i>",
-        "searching": "🔎 <i>Pesquisando...</i>",
-        "no_result": "❌ Nenhum resultado ou erro na API.",
-        "select_option": "❓ Selecione uma opção do menu.",
-        "back": "🔙 Voltar",
-        "cancel_btn": "❌ Cancelar",
-        "lang_btn": "🌐 Idioma",
-        "support_btn": "💬 Suporte",
-        "continue_btn": "✅ Continuar",
-        "join_required": ("🔒 <b>MEMBRESIA NECESSÁRIA</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                          "Entre no nosso canal e grupo para usar este bot.\n\n"
-                          "Depois toque em <b>✅ Continuar</b>.\n\n"
-                          "💬 <b>Suporte:</b> @Tony_M_unlock"),
-        "join_ok": "✅ Membresias verificadas. Bem-vindo!",
-        "join_fail": "❌ Entre no canal e no grupo primeiro.",
-        "maintenance": ("🛠 <b>E M   M A N U T E N Ç Ã O</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                        "⚠️ O bot está temporariamente <b>offline</b>\n"
-                        "para manutenção programada.\n\n"
-                        "🕒 Tente novamente em alguns instantes.\n\n"
-                        "💬 <b>Suporte:</b> @Tony_M_unlock"),
-        "banned_msg": ("🚫 <b>ACESSO BLOQUEADO</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                       "Sua conta foi suspensa."),
-        "current_lang": "🌐 Idioma atual: <b>{name}</b>",
-    },
-    "id": {
-        "welcome": ("✨ <b>S E L A M A T   D A T A N G</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    "🤖 <b>Bot OSINT Gratis</b>\n📓 Semua alat intelijen terbuka\n"
-                    "⚡ Cepat  •  🔒 Aman  •  🎯 Andal\n\n"
-                    "💬 <b>Dukungan:</b> @Tony_M_unlock"),
-        "select_feature": ("🛠 <b>M E N U   U T A M A</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                           "👮 <b>Pilih fitur untuk memulai:</b>\n\n💬 <b>Dukungan:</b> @Tony_M_unlock"),
-        "support": "💬 <b>Dukungan:</b> @Tony_M_unlock",
-        "cancelled": "❌ <b>Dibatalkan.</b>",
-        "choose_language": "🌐 <b>Silakan pilih bahasa Anda:</b>",
-        "language_set": "✅ Bahasa berhasil diperbarui.",
-        "send_cancel": "💡 <i>Kirim /cancel untuk membatalkan.</i>",
-        "searching": "🔎 <i>Mencari...</i>",
-        "no_result": "❌ Tidak ada hasil atau kesalahan API.",
-        "select_option": "❓ Silakan pilih opsi dari menu.",
-        "back": "🔙 Kembali",
-        "cancel_btn": "❌ Batal",
-        "lang_btn": "🌐 Bahasa",
-        "support_btn": "💬 Dukungan",
-        "continue_btn": "✅ Lanjutkan",
-        "join_required": ("🔒 <b>KEANGGOTAAN DIPERLUKAN</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                          "Gabung ke saluran dan grup kami untuk menggunakan bot ini.\n\n"
-                          "Setelah bergabung, ketuk <b>✅ Lanjutkan</b>.\n\n"
-                          "💬 <b>Dukungan:</b> @Tony_M_unlock"),
-        "join_ok": "✅ Keanggotaan diverifikasi. Selamat datang!",
-        "join_fail": "❌ Anda harus bergabung dengan saluran dan grup dulu.",
-        "maintenance": ("🛠 <b>D A L A M   P E M E L I H A R A A N</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                        "⚠️ Bot sementara <b>offline</b>\n"
-                        "untuk pemeliharaan terjadwal.\n\n"
-                        "🕒 Silakan coba lagi beberapa saat lagi.\n\n"
-                        "💬 <b>Dukungan:</b> @Tony_M_unlock"),
-        "banned_msg": ("🚫 <b>AKSES DIBLOKIR</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                       "Akun Anda telah ditangguhkan."),
-        "current_lang": "🌐 Bahasa saat ini: <b>{name}</b>",
-    },
 }
 
-
-def _register_lang(code, data):
-    """Merge compact translation data with English fallback."""
-    base = dict(TEXTS["en"])
-    base.update(data)
-    TEXTS[code] = base
-
-
-_register_lang("de", {
-    "welcome": "✨ <b>W I L L K O M M E N</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>Kostenloser OSINT-Bot</b>\n📓 Alle Tools freigeschaltet\n⚡ Schnell  •  🔒 Sicher  •  🎯 Zuverlässig\n\n💬 <b>Support:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>H A U P T M E N Ü</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>Wählen Sie eine Funktion:</b>",
-    "cancelled": "❌ <b>Abgebrochen.</b>",
-    "choose_language": "🌐 <b>Bitte wählen Sie Ihre Sprache:</b>",
-    "language_set": "✅ Sprache erfolgreich aktualisiert.",
-    "send_cancel": "💡 <i>Senden Sie /cancel zum Abbrechen.</i>",
-    "searching": "🔎 <i>Suche läuft...</i>",
-    "no_result": "❌ Kein Ergebnis oder API-Fehler.",
-    "select_option": "❓ Bitte wählen Sie eine Option.",
-    "back": "🔙 Zurück",
-    "cancel_btn": "❌ Abbrechen",
-    "lang_btn": "🌐 Sprache",
-    "support_btn": "💬 Support",
-    "continue_btn": "✅ Weiter",
-    "maintenance": "🛠 <b>W A R T U N G</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ Der Bot ist vorübergehend <b>offline</b> wegen geplanter Wartung.\n\n🕒 Bitte versuchen Sie es in Kürze erneut.\n\n💬 <b>Support:</b> @Tony_M_unlock",
-    "banned_msg": "🚫 <b>ZUGANG BLOCKIERT</b>\n\nIhr Konto wurde gesperrt.",
-    "current_lang": "🌐 Aktuelle Sprache: <b>{name}</b>",
-})
-_register_lang("zh", {
-    "welcome": "✨ <b>欢 迎</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>免费 OSINT 机器人</b>\n📓 所有工具已解锁\n⚡ 快速  •  🔒 安全  •  🎯 可靠\n\n💬 <b>支持:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>主 菜 单</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>请选择功能:</b>",
-    "cancelled": "❌ <b>已取消。</b>",
-    "choose_language": "🌐 <b>请选择您的语言:</b>",
-    "language_set": "✅ 语言更新成功。",
-    "send_cancel": "💡 <i>发送 /cancel 取消。</i>",
-    "searching": "🔎 <i>搜索中...</i>",
-    "no_result": "❌ 没有结果或 API 错误。",
-    "select_option": "❓ 请从菜单中选择一个选项。",
-    "back": "🔙 返回",
-    "cancel_btn": "❌ 取消",
-    "lang_btn": "🌐 语言",
-    "support_btn": "💬 支持",
-    "continue_btn": "✅ 继续",
-    "maintenance": "🛠 <b>维 护 中</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ 机器人因计划维护暂时<b>离线</b>。\n\n🕒 请稍后重试。\n\n💬 <b>支持:</b> @Tony_M_unlock",
-    "banned_msg": "🚫 <b>访问被阻止</b>\n\n您的账户已被暂停。",
-    "current_lang": "🌐 当前语言: <b>{name}</b>",
-})
-_register_lang("ja", {
-    "welcome": "✨ <b>よ う こ そ</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>無料 OSINT Bot</b>\n📓 すべてのツールが解除されました\n⚡ 高速  •  🔒 安全  •  🎯 信頼性\n\n💬 <b>サポート:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>メ イ ン メ ニ ュ ー</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>機能を選択してください:</b>",
-    "cancelled": "❌ <b>キャンセルされました。</b>",
-    "choose_language": "🌐 <b>言語を選択してください:</b>",
-    "language_set": "✅ 言語が正常に更新されました。",
-    "send_cancel": "💡 <i>/cancel を送信してキャンセル。</i>",
-    "searching": "🔎 <i>検索中...</i>",
-    "no_result": "❌ 結果なし、または API エラー。",
-    "select_option": "❓ メニューから選択してください。",
-    "back": "🔙 戻る",
-    "cancel_btn": "❌ キャンセル",
-    "lang_btn": "🌐 言語",
-    "support_btn": "💬 サポート",
-    "continue_btn": "✅ 続行",
-    "maintenance": "🛠 <b>メ ン テ ナ ン ス 中</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ Bot は定期メンテナンスのため一時的に<b>オフライン</b>です。\n\n🕒 しばらくしてからもう一度お試しください。\n\n💬 <b>サポート:</b> @Tony_M_unlock",
-    "banned_msg": "🚫 <b>アクセスがブロックされました</b>\n\nアカウントが停止されました。",
-    "current_lang": "🌐 現在の言語: <b>{name}</b>",
-})
-_register_lang("ko", {
-    "welcome": "✨ <b>환 영 합 니 다</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>무료 OSINT 봇</b>\n📓 모든 도구 잠금 해제\n⚡ 빠름  •  🔒 안전  •  🎯 신뢰성\n\n💬 <b>지원:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>메 인 메 뉴</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>기능을 선택하세요:</b>",
-    "cancelled": "❌ <b>취소되었습니다.</b>",
-    "choose_language": "🌐 <b>언어를 선택하세요:</b>",
-    "language_set": "✅ 언어가 업데이트되었습니다.",
-    "send_cancel": "💡 <i>/cancel 을 보내 취소하세요.</i>",
-    "searching": "🔎 <i>검색 중...</i>",
-    "no_result": "❌ 결과 없음 또는 API 오류.",
-    "select_option": "❓ 메뉴에서 옵션을 선택하세요.",
-    "back": "🔙 뒤로",
-    "cancel_btn": "❌ 취소",
-    "lang_btn": "🌐 언어",
-    "support_btn": "💬 지원",
-    "continue_btn": "✅ 계속",
-    "maintenance": "🛠 <b>점 검 중</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ 봇이 예정된 점검으로 인해\n일시적으로 <b>오프라인</b>입니다.\n\n🕒 잠시 후 다시 시도해주세요.\n\n💬 <b>지원:</b> @Tony_M_unlock",
-    "banned_msg": "🚫 <b>접근 차단됨</b>\n\n계정이 정지되었습니다.",
-    "current_lang": "🌐 현재 언어: <b>{name}</b>",
-})
-_register_lang("tr", {
-    "welcome": "✨ <b>H O Ş   G E L D İ N İ Z</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>Ücretsiz OSINT Botu</b>\n📓 Tüm araçlar açık\n⚡ Hızlı  •  🔒 Güvenli  •  🎯 Güvenilir\n\n💬 <b>Destek:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>A N A   M E N Ü</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>Bir özellik seçin:</b>",
-    "cancelled": "❌ <b>İptal edildi.</b>",
-    "choose_language": "🌐 <b>Lütfen dilinizi seçin:</b>",
-    "language_set": "✅ Dil başarıyla güncellendi.",
-    "send_cancel": "💡 <i>İptal için /cancel gönderin.</i>",
-    "searching": "🔎 <i>Aranıyor...</i>",
-    "no_result": "❌ Sonuç yok veya API hatası.",
-    "select_option": "❓ Lütfen menüden bir seçenek seçin.",
-    "back": "🔙 Geri",
-    "cancel_btn": "❌ İptal",
-    "lang_btn": "🌐 Dil",
-    "support_btn": "💬 Destek",
-    "continue_btn": "✅ Devam",
-    "maintenance": "🛠 <b>B A K I M D A</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ Bot planlı bakım nedeniyle\ngeçici olarak <b>çevrimdışı</b>.\n\n🕒 Lütfen kısa süre sonra tekrar deneyin.\n\n💬 <b>Destek:</b> @Tony_M_unlock",
-    "banned_msg": "🚫 <b>ERİŞİM ENGELLENDİ</b>\n\nHesabınız askıya alındı.",
-    "current_lang": "🌐 Geçerli dil: <b>{name}</b>",
-})
-_register_lang("fa", {
-    "welcome": "✨ <b>خ و ش   آ م د ی د</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>ربات OSINT رایگان</b>\n📓 همه ابزارها فعال شد\n⚡ سریع  •  🔒 امن  •  🎯 قابل اعتماد\n\n💬 <b>پشتیبانی:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>م ن و ی   ا ص ل ی</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>یک ویژگی انتخاب کنید:</b>",
-    "cancelled": "❌ <b>لغو شد.</b>",
-    "choose_language": "🌐 <b>لطفا زبان خود را انتخاب کنید:</b>",
-    "language_set": "✅ زبان با موفقیت بهروز شد.",
-    "send_cancel": "💡 <i>برای لغو /cancel بفرستید.</i>",
-    "searching": "🔎 <i>در حال جستجو...</i>",
-    "no_result": "❌ نتیجهای یافت نشد یا خطای API.",
-    "select_option": "❓ لطفا یک گزینه انتخاب کنید.",
-    "back": "🔙 بازگشت",
-    "cancel_btn": "❌ لغو",
-    "lang_btn": "🌐 زبان",
-    "support_btn": "💬 پشتیبانی",
-    "continue_btn": "✅ ادامه",
-    "maintenance": "🛠 <b>د ر   ح ا ل   ت ع م ی ر</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ ربات به دلیل تعمیرات برنامهریزی شده\nموقتاً <b>آفلاین</b> است.\n\n🕒 لطفاً کمی بعد دوباره تلاش کنید.\n\n💬 <b>پشتیبانی:</b> @Tony_M_unlock",
-    "banned_msg": "🚫 <b>دسترسی مسدود شد</b>\n\nحساب شما تعلیق شده است.",
-    "current_lang": "🌐 زبان فعلی: <b>{name}</b>",
-})
-_register_lang("it", {
-    "welcome": "✨ <b>B E N V E N U T O</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>Bot OSINT Gratuito</b>\n📓 Tutti gli strumenti sbloccati\n⚡ Veloce  •  🔒 Sicuro  •  🎯 Affidabile\n\n💬 <b>Supporto:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>M E N U   P R I N C I P A L E</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>Seleziona una funzione:</b>",
-    "cancelled": "❌ <b>Annullato.</b>",
-    "choose_language": "🌐 <b>Seleziona la tua lingua:</b>",
-    "language_set": "✅ Lingua aggiornata.",
-    "send_cancel": "💡 <i>Invia /cancel per annullare.</i>",
-    "searching": "🔎 <i>Ricerca...</i>",
-    "no_result": "❌ Nessun risultato o errore API.",
-    "select_option": "❓ Seleziona un'opzione dal menu.",
-    "back": "🔙 Indietro",
-    "cancel_btn": "❌ Annulla",
-    "lang_btn": "🌐 Lingua",
-    "support_btn": "💬 Supporto",
-    "continue_btn": "✅ Continua",
-    "maintenance": "🛠 <b>I N   M A N U T E N Z I O N E</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ Il bot è temporaneamente <b>offline</b>\nper manutenzione programmata.\n\n🕒 Riprova tra qualche istante.\n\n💬 <b>Supporto:</b> @Tony_M_unlock",
-    "banned_msg": "🚫 <b>ACCESSO BLOCCATO</b>\n\nIl tuo account è stato sospeso.",
-    "current_lang": "🌐 Lingua attuale: <b>{name}</b>",
-})
-_register_lang("vi", {
-    "welcome": "✨ <b>C H À O   M Ừ N G</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>Bot OSINT Miễn phí</b>\n📓 Tất cả công cụ đã mở khóa\n⚡ Nhanh  •  🔒 An toàn  •  🎯 Đáng tin\n\n💬 <b>Hỗ trợ:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>M E N U   C H Í N H</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>Chọn một tính năng:</b>",
-    "cancelled": "❌ <b>Đã hủy.</b>",
-    "choose_language": "🌐 <b>Vui lòng chọn ngôn ngữ:</b>",
-    "language_set": "✅ Đã cập nhật ngôn ngữ.",
-    "send_cancel": "💡 <i>Gửi /cancel để hủy.</i>",
-    "searching": "🔎 <i>Đang tìm...</i>",
-    "no_result": "❌ Không có kết quả hoặc lỗi API.",
-    "select_option": "❓ Vui lòng chọn từ menu.",
-    "back": "🔙 Quay lại",
-    "cancel_btn": "❌ Hủy",
-    "lang_btn": "🌐 Ngôn ngữ",
-    "support_btn": "💬 Hỗ trợ",
-    "continue_btn": "✅ Tiếp tục",
-    "maintenance": "🛠 <b>Đ A N G   B Ả O   T R Ì</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ Bot tạm thời <b>offline</b>\nđể bảo trì theo lịch.\n\n🕒 Vui lòng thử lại sau ít phút.\n\n💬 <b>Hỗ trợ:</b> @Tony_M_unlock",
-    "banned_msg": "🚫 <b>TRUY CẬP BỊ CHẶN</b>\n\nTài khoản của bạn đã bị đình chỉ.",
-    "current_lang": "🌐 Ngôn ngữ hiện tại: <b>{name}</b>",
-})
-_register_lang("th", {
-    "welcome": "✨ <b>ย ิ น ดี ต ้ อ น ร ั บ</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>บอท OSINT ฟรี</b>\n📓 ปลดล็อกเครื่องมือทั้งหมด\n⚡ เร็ว  •  🔒 ปลอดภัย  •  🎯 เชื่อถือได้\n\n💬 <b>สนับสนุน:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>เ ม น ู ห ล ั ก</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>เลือกคุณสมบัติ:</b>",
-    "cancelled": "❌ <b>ยกเลิกแล้ว</b>",
-    "choose_language": "🌐 <b>เลือกภาษาของคุณ:</b>",
-    "language_set": "✅ อัปเดตภาษาเรียบร้อย",
-    "send_cancel": "💡 <i>ส่ง /cancel เพื่อยกเลิก</i>",
-    "searching": "🔎 <i>กำลังค้นหา...</i>",
-    "no_result": "❌ ไม่พบผลลัพธ์หรือเกิดข้อผิดพลาด",
-    "select_option": "❓ เลือกตัวเลือกจากเมนู",
-    "back": "🔙 กลับ",
-    "cancel_btn": "❌ ยกเลิก",
-    "lang_btn": "🌐 ภาษา",
-    "support_btn": "💬 สนับสนุน",
-    "continue_btn": "✅ ดำเนินการต่อ",
-    "maintenance": "🛠 <b>อ ย ู ่ ร ะ ห ว ่ า ง ก า ร บ ำ ร ุ ง ร ั ก ษ า</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ บอท <b>ออฟไลน์</b> ชั่วคราว\nเนื่องจากการบำรุงรักษาตามกำหนด\n\n🕒 โปรดลองใหม่ภายหลัง\n\n💬 <b>สนับสนุน:</b> @Tony_M_unlock",
-    "banned_msg": "🚫 <b>การเข้าถึงถูกบล็อก</b>\n\nบัญชีของคุณถูกระงับ",
-    "current_lang": "🌐 ภาษาปัจจุบัน: <b>{name}</b>",
-})
-_register_lang("ta", {
-    "welcome": "✨ <b>வ ர வ ே ற ் ப ு</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>இலவச OSINT போட்</b>\n📓 அனைத்து கருவிகளும் திறக்கப்பட்டன\n⚡ வேகம்  •  🔒 பாதுகாப்பு  •  🎯 நம்பகத்தன்மை\n\n💬 <b>ஆதரவு:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>ம ு க ் க ி ய   ம ெ ன ு</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>ஒரு அம்சத்தை தேர்ந்தெடுக்கவும்:</b>",
-    "cancelled": "❌ <b>ரத்து செய்யப்பட்டது.</b>",
-    "choose_language": "🌐 <b>உங்கள் மொழியை தேர்ந்தெடுக்கவும்:</b>",
-    "language_set": "✅ மொழி புதுப்பிக்கப்பட்டது.",
-    "send_cancel": "💡 <i>ரத்து செய்ய /cancel அனுப்பவும்.</i>",
-    "searching": "🔎 <i>தேடுகிறது...</i>",
-    "no_result": "❌ முடிவு இல்லை அல்லது API பிழை.",
-    "select_option": "❓ மெனுவிலிருந்து ஒரு விருப்பத்தை தேர்ந்தெடுக்கவும்.",
-    "back": "🔙 பின்செல்",
-    "cancel_btn": "❌ ரத்து",
-    "lang_btn": "🌐 மொழி",
-    "support_btn": "💬 ஆதரவு",
-    "continue_btn": "✅ தொடரவும்",
-    "maintenance": "🛠 <b>ப ர ா ம ர ி ப ் ப ு   ந ட ை ப ெ ற ு க ி ற த ு</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ திட்டமிடப்பட்ட பராமரிப்பு காரணமாக\nபோட் தற்காலிகமாக <b>ஆஃப்லைன்</b> உள்ளது.\n\n🕒 சிறிது நேரம் கழித்து மீண்டும் முயற்சிக்கவும்.\n\n💬 <b>ஆதரவு:</b> @Tony_M_unlock",
-    "banned_msg": "🚫 <b>அணுகல் தடுக்கப்பட்டது</b>\n\nஉங்கள் கணக்கு இடைநிறுத்தப்பட்டது.",
-    "current_lang": "🌐 தற்போதைய மொழி: <b>{name}</b>",
-})
-_register_lang("te", {
-    "welcome": "✨ <b>స ్ వ ా గ త ం</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>ఉచిత OSINT బాట్</b>\n📓 అన్ని సాధనాలు అన్లాక్\n⚡ వేగం  •  🔒 సురక్షితం  •  🎯 విశ్వసనీయం\n\n💬 <b>మద్దతు:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>ప ్ ర ధ ా న   మ ె న ూ</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>ఒక ఫీచర్ ఎంచుకోండి:</b>",
-    "cancelled": "❌ <b>రద్దు చేయబడింది.</b>",
-    "choose_language": "🌐 <b>మీ భాషను ఎంచుకోండి:</b>",
-    "language_set": "✅ భాష నవీకరించబడింది.",
-    "send_cancel": "💡 <i>రద్దు కోసం /cancel పంపండి.</i>",
-    "searching": "🔎 <i>వెతుకుతోంది...</i>",
-    "no_result": "❌ ఫలితం లేదు లేదా API లోపం.",
-    "select_option": "❓ మెనూ నుండి ఎంపిక చేయండి.",
-    "back": "🔙 వెనుకకు",
-    "cancel_btn": "❌ రద్దు",
-    "lang_btn": "🌐 భాష",
-    "support_btn": "💬 మద్దతు",
-    "continue_btn": "✅ కొనసాగించు",
-    "maintenance": "🛠 <b>న ి ర ్ వ హ ణ   ల ో   ఉ ం ద ి</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ షెడ్యూల్ నిర్వహణ కారణంగా\nబాట్ తాత్కాలికంగా <b>ఆఫ్లైన్</b>.\n\n🕒 కొద్దిసేపటి తర్వాత మళ్లీ ప్రయత్నించండి.\n\n💬 <b>మద్దతు:</b> @Tony_M_unlock",
-    "banned_msg": "🚫 <b>యాక్సెస్ బ్లాక్ చేయబడింది</b>\n\nమీ ఖాతా సస్పెండ్ చేయబడింది.",
-    "current_lang": "🌐 ప్రస్తుత భాష: <b>{name}</b>",
-})
-_register_lang("mr", {
-    "welcome": "✨ <b>स ् व ा ग त</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>मोफत OSINT बॉट</b>\n📓 सर्व साधने अनलॉक\n⚡ वेगवान  •  🔒 सुरक्षित  •  🎯 विश्वसनीय\n\n💬 <b>सपोर्ट:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>म ु ख ् य   म े न ू</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>वैशिष्ट्य निवडा:</b>",
-    "cancelled": "❌ <b>रद्द केले.</b>",
-    "choose_language": "🌐 <b>तुमची भाषा निवडा:</b>",
-    "language_set": "✅ भाषा अपडेट झाली.",
-    "send_cancel": "💡 <i>रद्द करण्यासाठी /cancel पाठवा.</i>",
-    "searching": "🔎 <i>शोधत आहोत...</i>",
-    "no_result": "❌ निकाल नाही किंवा API त्रुटी.",
-    "select_option": "❓ मेनूमधून पर्याय निवडा.",
-    "back": "🔙 मागे",
-    "cancel_btn": "❌ रद्द करा",
-    "lang_btn": "🌐 भाषा",
-    "support_btn": "💬 सपोर्ट",
-    "continue_btn": "✅ सुरू ठेवा",
-    "maintenance": "🛠 <b>द े ख भ ा ल   स ु र ू</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ नियोजित देखभालीमुळे\nबॉट तात्पुरता <b>ऑफलाइन</b> आहे.\n\n🕒 कृपया थोड्या वेळाने पुन्हा प्रयत्न करा.\n\n💬 <b>सपोर्ट:</b> @Tony_M_unlock",
-    "banned_msg": "🚫 <b>प्रवेश अवरोधित</b>\n\nतुमचे खाते निलंबित केले आहे.",
-    "current_lang": "🌐 सध्याची भाषा: <b>{name}</b>",
-})
-_register_lang("gu", {
-    "welcome": "✨ <b>સ ્ વ ા ગ ત</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>મફત OSINT બોટ</b>\n📓 બધા સાધનો અનલૉક\n⚡ ઝડપી  •  🔒 સુરક્ષિત  •  🎯 વિશ્વસનીય\n\n💬 <b>સપોર્ટ:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>મ ુ ખ ્ ય   મ ે ન ૂ</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>એક સુવિધા પસંદ કરો:</b>",
-    "cancelled": "❌ <b>રદ કર્યું.</b>",
-    "choose_language": "🌐 <b>તમારી ભાષા પસંદ કરો:</b>",
-    "language_set": "✅ ભાષા અપડેટ થઈ.",
-    "send_cancel": "💡 <i>રદ કરવા /cancel મોકલો.</i>",
-    "searching": "🔎 <i>શોધી રહ્યું છે...</i>",
-    "no_result": "❌ કોઈ પરિણામ નથી અથવા API ભૂલ.",
-    "select_option": "❓ મેનૂમાંથી વિકલ્પ પસંદ કરો.",
-    "back": "🔙 પાછળ",
-    "cancel_btn": "❌ રદ કરો",
-    "lang_btn": "🌐 ભાષા",
-    "support_btn": "💬 સપોર્ટ",
-    "continue_btn": "✅ ચાલુ રાખો",
-    "maintenance": "🛠 <b>જ ા ળ વ ણ ી   ચ ા લ ુ   છ ે</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ નિર્ધારિત જાળવણીને કારણે\nબોટ અસ્થાયી રૂપે <b>ઑફલાઇન</b> છે.\n\n🕒 થોડા સમય પછી ફરી પ્રયાસ કરો.\n\n💬 <b>સપોર્ટ:</b> @Tony_M_unlock",
-    "banned_msg": "🚫 <b>એક્સેસ બ્લોક</b>\n\nતમારું એકાઉન્ટ સસ્પેન્ડ કર્યું છે.",
-    "current_lang": "🌐 વર્તમાન ભાષા: <b>{name}</b>",
-})
-_register_lang("pa", {
-    "welcome": "✨ <b>ਜ ੀ   ਆ ਇ ਆ ਂ   ਨ ੂ ਂ</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>ਮੁਫ਼ਤ OSINT ਬੋਟ</b>\n📓 ਸਾਰੇ ਸਾਧਨ ਅਨਲੌਕ\n⚡ ਤੇਜ਼  •  🔒 ਸੁਰੱਖਿਅਤ  •  🎯 ਭਰੋਸੇਯੋਗ\n\n💬 <b>ਸਪੋਰਟ:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>ਮ ੁ ਖ   ਮ ੀ ਨ ੂ</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>ਇੱਕ ਵਿਸ਼ੇਸ਼ਤਾ ਚੁਣੋ:</b>",
-    "cancelled": "❌ <b>ਰੱਦ ਕੀਤਾ।</b>",
-    "choose_language": "🌐 <b>ਆਪਣੀ ਭਾਸ਼ਾ ਚੁਣੋ:</b>",
-    "language_set": "✅ ਭਾਸ਼ਾ ਅੱਪਡੇਟ ਹੋ ਗਈ।",
-    "send_cancel": "💡 <i>ਰੱਦ ਕਰਨ ਲਈ /cancel ਭੇਜੋ।</i>",
-    "searching": "🔎 <i>ਖੋਜ ਰਿਹਾ ਹੈ...</i>",
-    "no_result": "❌ ਕੋਈ ਨਤੀਜਾ ਨਹੀਂ ਜਾਂ API ਗਲਤੀ।",
-    "select_option": "❓ ਮੀਨੂ ਵਿੱਚੋਂ ਚੁਣੋ।",
-    "back": "🔙 ਵਾਪਸ",
-    "cancel_btn": "❌ ਰੱਦ ਕਰੋ",
-    "lang_btn": "🌐 ਭਾਸ਼ਾ",
-    "support_btn": "💬 ਸਪੋਰਟ",
-    "continue_btn": "✅ ਜਾਰੀ ਰੱਖੋ",
-    "maintenance": "🛠 <b>ਰ ੱ ਖ - ਰ ਖ ਾ ਵ   ਜ ਾ ਰ ੀ   ਹ ੈ</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ ਤਹਿ ਕੀਤੀ ਸੰਭਾਲ ਕਾਰਨ\nਬੋਟ ਅਸਥਾਈ ਤੌਰ ਤੇ <b>ਔਫਲਾਈਨ</b> ਹੈ।\n\n🕒 ਕਿਰਪਾ ਕਰਕੇ ਥੋੜ੍ਹੀ ਦੇਰ ਬਾਅਦ ਦੁਬਾਰਾ ਕੋਸ਼ਿਸ਼ ਕਰੋ।\n\n💬 <b>ਸਪੋਰਟ:</b> @Tony_M_unlock",
-    "banned_msg": "🚫 <b>ਪਹੁੰਚ ਬਲੌਕ</b>\n\nਤੁਹਾਡਾ ਖਾਤਾ ਮੁਅੱਤਲ ਕੀਤਾ ਗਿਆ ਹੈ।",
-    "current_lang": "🌐 ਮੌਜੂਦਾ ਭਾਸ਼ਾ: <b>{name}</b>",
-})
-_register_lang("ml", {
-    "welcome": "✨ <b>സ ് വ ാ ഗ ത ം</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>സൗജന്യ OSINT ബോട്ട്</b>\n📓 എല്ലാ ഉപകരണങ്ങളും അൺലോക്ക്\n⚡ വേഗം  •  🔒 സുരക്ഷിതം  •  🎯 വിശ്വസനീയം\n\n💬 <b>പിന്തുണ:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>പ ് ര ധ ా ന   മ െ ന ു</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>ഒരു സവിശേഷത തിരഞ്ഞെടുക്കുക:</b>",
-    "cancelled": "❌ <b>റദ്ദാക്കി.</b>",
-    "choose_language": "🌐 <b>നിങ്ങളുടെ ഭാഷ തിരഞ്ഞെടുക്കുക:</b>",
-    "language_set": "✅ ഭാഷ അപ്ഡേറ്റ് ചെയ്തു.",
-    "send_cancel": "💡 <i>റദ്ദാക്കാൻ /cancel അയയ്ക്കുക.</i>",
-    "searching": "🔎 <i>തിരയുന്നു...</i>",
-    "no_result": "❌ ഫലമില്ല അല്ലെങ്കിൽ API പിശക്.",
-    "select_option": "❓ മെനുവിൽ നിന്ന് തിരഞ്ഞെടുക്കുക.",
-    "back": "🔙 പിന്നോട്ട്",
-    "cancel_btn": "❌ റദ്ദാക്കുക",
-    "lang_btn": "🌐 ഭാഷ",
-    "support_btn": "💬 പിന്തുണ",
-    "continue_btn": "✅ തുടരുക",
-    "maintenance": "🛠 <b>അ റ ് റ ് ക ു ട ് ത ൽ   ന ട ക ് ക ു ന ് ന ു</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ ഷെഡ്യൂൾ ചെയ്ത അറ്റകുറ്റപ്പണി കാരണം\nബോട്ട് താൽക്കാലികമായി <b>ഓഫ്ലൈൻ</b> ആണ്.\n\n🕒 കുറച്ചു കഴിഞ്ഞ് വീണ്ടും ശ്രമിക്കുക.\n\n💬 <b>പിന്തുണ:</b> @Tony_M_unlock",
-    "banned_msg": "🚫 <b>ആക്സസ് ബ്ലോക്ക്</b>\n\nനിങ്ങളുടെ അക്കൗണ്ട് സസ്പെൻഡ് ചെയ്തു.",
-    "current_lang": "🌐 നിലവിലെ ഭാഷ: <b>{name}</b>",
-})
-_register_lang("nl", {
-    "welcome": "✨ <b>W E L K O M</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>Gratis OSINT Bot</b>\n📓 Alle tools ontgrendeld\n⚡ Snel  •  🔒 Veilig  •  🎯 Betrouwbaar\n\n💬 <b>Ondersteuning:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>H O O F D M E N U</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>Selecteer een functie:</b>",
-    "cancelled": "❌ <b>Geannuleerd.</b>",
-    "choose_language": "🌐 <b>Kies uw taal:</b>",
-    "language_set": "✅ Taal succesvol bijgewerkt.",
-    "send_cancel": "💡 <i>Stuur /cancel om te annuleren.</i>",
-    "searching": "🔎 <i>Zoeken...</i>",
-    "no_result": "❌ Geen resultaat of API-fout.",
-    "select_option": "❓ Selecteer een optie.",
-    "back": "🔙 Terug",
-    "cancel_btn": "❌ Annuleren",
-    "lang_btn": "🌐 Taal",
-    "support_btn": "💬 Ondersteuning",
-    "continue_btn": "✅ Doorgaan",
-    "maintenance": "🛠 <b>O N D E R H O U D</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ De bot is tijdelijk <b>offline</b>\nvanwege gepland onderhoud.\n\n🕒 Probeer het over een moment opnieuw.\n\n💬 <b>Ondersteuning:</b> @Tony_M_unlock",
-    "banned_msg": "🚫 <b>TOEGANG GEBLOKKEERD</b>\n\nUw account is opgeschort.",
-    "current_lang": "🌐 Huidige taal: <b>{name}</b>",
-})
-_register_lang("pl", {
-    "welcome": "✨ <b>W I T A M Y</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>Darmowy Bot OSINT</b>\n📓 Wszystkie narzędzia odblokowane\n⚡ Szybko  •  🔒 Bezpiecznie  •  🎯 Niezawodnie\n\n💬 <b>Wsparcie:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>M E N U   G Ł Ó W N E</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>Wybierz funkcję:</b>",
-    "cancelled": "❌ <b>Anulowano.</b>",
-    "choose_language": "🌐 <b>Wybierz swój język:</b>",
-    "language_set": "✅ Język zaktualizowany.",
-    "send_cancel": "💡 <i>Wyślij /cancel aby anulować.</i>",
-    "searching": "🔎 <i>Szukam...</i>",
-    "no_result": "❌ Brak wyników lub błąd API.",
-    "select_option": "❓ Wybierz opcję z menu.",
-    "back": "🔙 Wstecz",
-    "cancel_btn": "❌ Anuluj",
-    "lang_btn": "🌐 Język",
-    "support_btn": "💬 Wsparcie",
-    "continue_btn": "✅ Kontynuuj",
-    "maintenance": "🛠 <b>K O N S E R W A C J A</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ Bot jest tymczasowo <b>offline</b>\nz powodu zaplanowanej konserwacji.\n\n🕒 Spróbuj ponownie za chwilę.\n\n💬 <b>Wsparcie:</b> @Tony_M_unlock",
-    "banned_msg": "🚫 <b>DOSTĘP ZABLOKOWANY</b>\n\nTwoje konto zostało zawieszone.",
-    "current_lang": "🌐 Aktualny język: <b>{name}</b>",
-})
-_register_lang("uk", {
-    "welcome": "✨ <b>Л А С К А В О   П Р О С И М О</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>Безкоштовний OSINT-бот</b>\n📓 Усі інструменти розблоковано\n⚡ Швидко  •  🔒 Безпечно  •  🎯 Надійно\n\n💬 <b>Підтримка:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>Г О Л О В Н Е   М Е Н Ю</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>Оберіть функцію:</b>",
-    "cancelled": "❌ <b>Скасовано.</b>",
-    "choose_language": "🌐 <b>Оберіть мову:</b>",
-    "language_set": "✅ Мову оновлено.",
-    "send_cancel": "💡 <i>Надішліть /cancel щоб скасувати.</i>",
-    "searching": "🔎 <i>Пошук...</i>",
-    "no_result": "❌ Немає результатів або помилка API.",
-    "select_option": "❓ Оберіть пункт з меню.",
-    "back": "🔙 Назад",
-    "cancel_btn": "❌ Скасувати",
-    "lang_btn": "🌐 Мова",
-    "support_btn": "💬 Підтримка",
-    "continue_btn": "✅ Продовжити",
-    "maintenance": "🛠 <b>О Б С Л У Г О В У В А Н Н Я</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ Бот тимчасово <b>недоступний</b>\nчерез планове обслуговування.\n\n🕒 Спробуйте пізніше.\n\n💬 <b>Підтримка:</b> @Tony_M_unlock",
-    "banned_msg": "🚫 <b>ДОСТУП ЗАБЛОКОВАНО</b>\n\nВаш акаунт призупинено.",
-    "current_lang": "🌐 Поточна мова: <b>{name}</b>",
-})
-_register_lang("ro", {
-    "welcome": "✨ <b>B I N E   A Ț I   V E N I T</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>Bot OSINT Gratuit</b>\n📓 Toate instrumentele deblocate\n⚡ Rapid  •  🔒 Sigur  •  🎯 Fiabil\n\n💬 <b>Suport:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>M E N I U   P R I N C I P A L</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>Selectați o funcție:</b>",
-    "cancelled": "❌ <b>Anulat.</b>",
-    "choose_language": "🌐 <b>Alegeți limba:</b>",
-    "language_set": "✅ Limba a fost actualizată.",
-    "send_cancel": "💡 <i>Trimiteți /cancel pentru a anula.</i>",
-    "searching": "🔎 <i>Căutare...</i>",
-    "no_result": "❌ Niciun rezultat sau eroare API.",
-    "select_option": "❓ Selectați o opțiune.",
-    "back": "🔙 Înapoi",
-    "cancel_btn": "❌ Anulează",
-    "lang_btn": "🌐 Limbă",
-    "support_btn": "💬 Suport",
-    "continue_btn": "✅ Continuă",
-    "maintenance": "🛠 <b>Î N   M E N T E N A N Ț Ă</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ Botul este temporar <b>offline</b>\npentru mentenanță programată.\n\n🕒 Încercați din nou în curând.\n\n💬 <b>Suport:</b> @Tony_M_unlock",
-    "banned_msg": "🚫 <b>ACCES BLOCAT</b>\n\nContul dvs. a fost suspendat.",
-    "current_lang": "🌐 Limba curentă: <b>{name}</b>",
-})
-_register_lang("sw", {
-    "welcome": "✨ <b>K A R I B U</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>Bot ya OSINT ya Bure</b>\n📓 Zana zote zimefunguliwa\n⚡ Haraka  •  🔒 Salama  •  🎯 Kuaminika\n\n💬 <b>Msaada:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>M E N Y U   K U U</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>Chagua kipengele:</b>",
-    "cancelled": "❌ <b>Imefutwa.</b>",
-    "choose_language": "🌐 <b>Chagua lugha yako:</b>",
-    "language_set": "✅ Lugha imesasishwa.",
-    "send_cancel": "💡 <i>Tuma /cancel kufuta.</i>",
-    "searching": "🔎 <i>Inatafuta...</i>",
-    "no_result": "❌ Hakuna matokeo au hitilafu ya API.",
-    "select_option": "❓ Chagua chaguo kutoka kwenye menyu.",
-    "back": "🔙 Nyuma",
-    "cancel_btn": "❌ Ghairi",
-    "lang_btn": "🌐 Lugha",
-    "support_btn": "💬 Msaada",
-    "continue_btn": "✅ Endelea",
-    "maintenance": "🛠 <b>M A T E N G E N E Z O</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ Bot haipatikani kwa muda\nkwa matengenezo yaliyopangwa.\n\n🕒 Jaribu tena baadaye kidogo.\n\n💬 <b>Msaada:</b> @Tony_M_unlock",
-    "banned_msg": "🚫 <b>Ufikiaji Umezuiwa</b>\n\nAkaunti yako imesimamishwa.",
-    "current_lang": "🌐 Lugha ya sasa: <b>{name}</b>",
-})
-_register_lang("ms", {
-    "welcome": "✨ <b>S E L A M A T   D A T A N G</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>Bot OSINT Percuma</b>\n📓 Semua alat dibuka\n⚡ Pantas  •  🔒 Selamat  •  🎯 Boleh dipercayai\n\n💬 <b>Sokongan:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>M E N U   U T A M A</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>Pilih ciri:</b>",
-    "cancelled": "❌ <b>Dibatalkan.</b>",
-    "choose_language": "🌐 <b>Pilih bahasa anda:</b>",
-    "language_set": "✅ Bahasa dikemas kini.",
-    "send_cancel": "💡 <i>Hantar /cancel untuk batal.</i>",
-    "searching": "🔎 <i>Mencari...</i>",
-    "no_result": "❌ Tiada hasil atau ralat API.",
-    "select_option": "❓ Pilih pilihan dari menu.",
-    "back": "🔙 Kembali",
-    "cancel_btn": "❌ Batal",
-    "lang_btn": "🌐 Bahasa",
-    "support_btn": "💬 Sokongan",
-    "continue_btn": "✅ Teruskan",
-    "maintenance": "🛠 <b>P E N Y E L E N G G A R A A N</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ Bot tidak tersedia sementara\nuntuk penyelenggaraan berjadual.\n\n🕒 Cuba lagi sebentar lagi.\n\n💬 <b>Sokongan:</b> @Tony_M_unlock",
-    "banned_msg": "🚫 <b>AKSES DIBLOK</b>\n\nAkaun anda telah digantung.",
-    "current_lang": "🌐 Bahasa semasa: <b>{name}</b>",
-})
-_register_lang("fil", {
-    "welcome": "✨ <b>M A L I G A Y A N G   P A G D A T I N G</b> ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🤖 <b>Libreng OSINT Bot</b>\n📓 Naka-unlock lahat ng tool\n⚡ Mabilis  •  🔒 Ligtas  •  🎯 Maaasahan\n\n💬 <b>Suporta:</b> @Tony_M_unlock",
-    "select_feature": "🛠 <b>P A N G U N A H I N G   M E N U</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 <b>Pumili ng feature:</b>",
-    "cancelled": "❌ <b>Kinansela.</b>",
-    "choose_language": "🌐 <b>Pumili ng wika:</b>",
-    "language_set": "✅ Na-update ang wika.",
-    "send_cancel": "💡 <i>Ipadala ang /cancel para kanselahin.</i>",
-    "searching": "🔎 <i>Naghahanap...</i>",
-    "no_result": "❌ Walang resulta o error sa API.",
-    "select_option": "❓ Pumili ng opsyon sa menu.",
-    "back": "🔙 Bumalik",
-    "cancel_btn": "❌ Kanselahin",
-    "lang_btn": "🌐 Wika",
-    "support_btn": "💬 Suporta",
-    "continue_btn": "✅ Magpatuloy",
-    "maintenance": "🛠 <b>P A G P A P A N A T I L I</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ Pansamantalang <b>offline</b> ang bot\npara sa naka-iskedyul na pagpapanatili.\n\n🕒 Subukan muli mamaya.\n\n💬 <b>Suporta:</b> @Tony_M_unlock",
-    "banned_msg": "🚫 <b>NAKA-BLOCK ANG ACCESS</b>\n\nSinuspinde ang iyong account.",
-    "current_lang": "🌐 Kasalukuyang wika: <b>{name}</b>",
-})
+for _code in LANGUAGES:
+    if _code not in TEXTS:
+        TEXTS[_code] = dict(TEXTS["en"])
 
 
 def t(lang, key, **kwargs):
-    """Safe translation lookup — falls back to English, never crashes."""
     pack = TEXTS.get(lang) or TEXTS["en"]
     template = pack.get(key) or TEXTS["en"].get(key) or key
     try:
@@ -1365,18 +882,18 @@ def lang_label(code):
 # ============================================================
 API_CONFIG = {
     "🪪 Aadhaar Info": {
-        "url": "https://travelers-creature-sarah-rogers.trycloudflare.com/search?q=",
+        "url": "https://leakosintapi.com/",
         "prompt": "🪪 Send a 12-digit Aadhaar number.",
         "command": "/adhr",
     },
     "📞 Number Info": {
-        "url": "https://talks-chain-restrictions-statistics.trycloudflare.com/search?query=",
-        "prompt": "📞 Send a 10-digit Indian number (without +91).\nExample: 9712073901",
+        "url": "https://leakosintapi.com/",
+        "prompt": "📞 Send a 10-digit Indian number (with +91).\nExample: +919712073901",
         "command": "/num",
     },
     "📭 PIN Code": {
-        "url": "https://talks-chain-restrictions-statistics.trycloudflare.com/search?query=",
-        "prompt": "📭 Send a PIN code.",
+        "url": "https://ghost-pincode-lookup-api.vercel.app/api/pincode/india/",
+        "prompt": "📭 Send a 6-digit PIN code.\nExample: 560076",
         "command": "/pin",
     },
     "🚘 Vehicle Info": {
@@ -1390,7 +907,7 @@ API_CONFIG = {
         "command": "/tgid",
     },
     "🆔 PAN Info": {
-        "url": "https://paninfo.noob73613.workers.dev/pan?pan=",
+        "url": "https://leakosintapi.com/",
         "prompt": "🆔 Send a PAN number.",
         "command": "/pan",
     },
@@ -1400,8 +917,8 @@ API_CONFIG = {
         "command": "/tgid2",
     },
     "💳 IFSC Info": {
-        "url": "https://talks-chain-restrictions-statistics.trycloudflare.com/search?query=",
-        "prompt": "💳 Send an IFSC code.",
+        "url": "https://dass-api.netlify.app/api/ifsc?code=",
+        "prompt": "💳 Send an 11-character IFSC code.\nExample: SBIN0000001",
         "command": "/ifsc",
     },
     "🏦 UPI Info": {
@@ -1410,18 +927,32 @@ API_CONFIG = {
         "command": "/upi",
     },
     "📧 Email Info": {
-        "url": "https://talks-chain-restrictions-statistics.trycloudflare.com/search?query=",
+        "url": "https://leakosintapi.com/",
         "prompt": "📧 Send an email address.",
         "command": "/email",
     },
     "🌐 IP Info": {
-        "url": "https://talks-chain-restrictions-statistics.trycloudflare.com/search?query=",
-        "prompt": "🌐 Send an IP address.",
+        "url": "https://ipwho.is/",
+        "prompt": "🌐 Send an IP address.\nExample: 9.9.9.9",
         "command": "/ip",
     },
 }
 
 COMMAND_FEATURE_MAP = {v["command"]: k for k, v in API_CONFIG.items() if v.get("command")}
+
+
+def is_feature_available(api_name):
+    """Return True only if the feature has a real, usable API endpoint."""
+    cfg = API_CONFIG.get(api_name)
+    if not cfg:
+        return False
+    url = (cfg.get("url") or "").strip()
+    if not url:
+        return False
+    low = url.lower()
+    if "your_" in low or "example.com" in low or "placeholder" in low or low in ("none", "null", "-"):
+        return False
+    return True
 
 
 # ============================================================
@@ -1538,6 +1069,15 @@ def delete_message(chat_id, message_id):
         print("delMsg err:", e)
 
 
+def send_chat_action(chat_id, action="typing"):
+    try:
+        HTTP.post(f"{USER_TG_API}/sendChatAction",
+                  data={"chat_id": chat_id, "action": action},
+                  timeout=(3, 6))
+    except Exception:
+        pass
+
+
 def get_chat_member(chat_id, user_id):
     if not chat_id or not user_id:
         return None
@@ -1553,22 +1093,16 @@ def get_chat_member(chat_id, user_id):
 
 
 def leave_chat(chat_id):
-    """Force the user bot to leave a group / supergroup / channel."""
     try:
-        HTTP.post(f"{USER_TG_API}/leaveChat",
-                  data={"chat_id": chat_id},
-                  timeout=(5, 10))
+        HTTP.post(f"{USER_TG_API}/leaveChat", data={"chat_id": chat_id}, timeout=(5, 10))
         print(f"👋 User bot left chat {chat_id}")
     except Exception as e:
         print(f"leaveChat err: {e}")
 
 
 def leave_admin_chat(chat_id):
-    """Force the admin bot to leave a group / supergroup / channel."""
     try:
-        ADMIN_HTTP.post(f"{ADMIN_TG_APIS[1]}/leaveChat",
-                        data={"chat_id": chat_id},
-                        timeout=(5, 10))
+        ADMIN_HTTP.post(f"{ADMIN_TG_APIS[1]}/leaveChat", data={"chat_id": chat_id}, timeout=(5, 10))
         print(f"👋 Admin bot left chat {chat_id}")
     except Exception as e:
         print(f"admin leaveChat err: {e}")
@@ -1628,12 +1162,20 @@ def check_user_joined(user_id):
 # 12. USER KEYBOARDS
 # ============================================================
 def main_keyboard(lang="en"):
-    buttons = list(API_CONFIG.keys())
-    keyboard = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    feature_order = [
+        "🪪 Aadhaar Info", "🆔 PAN Info",
+        "📞 Number Info",  "📧 Email Info",
+        "🤖 TG Username",  "📱 TG Chat ID",
+        "🏦 UPI Info",     "💳 IFSC Info",
+        "📭 PIN Code",     "🌐 IP Info",
+        "🚘 Vehicle Info"
+    ]
+    keyboard = [feature_order[i:i + 2] for i in range(0, len(feature_order), 2)]
     if len(keyboard[-1]) == 1:
         keyboard[-1].append(t(lang, "cancel_btn"))
     else:
         keyboard.append([t(lang, "cancel_btn")])
+    keyboard.append([t(lang, "tokens_btn"), t(lang, "refer_btn")])
     keyboard.append([t(lang, "lang_btn"), t(lang, "support_btn")])
     return {"keyboard": keyboard, "resize_keyboard": True, "one_time_keyboard": False}
 
@@ -1671,6 +1213,32 @@ def force_join_keyboard(lang="en"):
         [{"text": t(lang, "continue_btn"), "callback_data": "user:continue"}],
         [{"text": "💬 Contact Support (@Tony_M_unlock)", "url": SUPPORT_URL}],
     ]}
+
+
+def token_status_keyboard(uid, lang="en"):
+    rows = []
+    rec = USER_TOKENS.get(uid) or {}
+    if not rec.get("max_upgraded"):
+        rows.append([{"text": f"💠 Extend Max (+{TOKEN_CFG['max_upgrade_add']}) — ${TOKEN_CFG['price_max_upgrade']}",
+                      "callback_data": "tok:buy:max"}])
+    if not rec.get("regen_upgraded"):
+        rows.append([{"text": f"⚡ Fast Regen (0.5s) — ${TOKEN_CFG['price_regen']}",
+                      "callback_data": "tok:buy:regen"}])
+    rows.append([{"text": f"🔋 Instant Refill — ${TOKEN_CFG['price_refill']}",
+                  "callback_data": "tok:buy:refill"}])
+    rows.append([{"text": "🎁 My Referral Link", "callback_data": "tok:ref"}])
+    rows.append([{"text": "❌ Close", "callback_data": "user:cancel"}])
+    return {"inline_keyboard": rows}
+
+
+def referral_inline_keyboard(uid):
+    bot_un = _BOT_USERNAME_CACHE.get("username") or "YourBot"
+    link = f"https://t.me/{bot_un}?start=ref_{uid}"
+    rows = [
+        [{"text": "🔗 Copy Referral Link", "copy_text": {"text": link}}],
+        [{"text": "🔙 Back", "callback_data": "tok:status"}],
+    ]
+    return {"inline_keyboard": rows}
 
 
 # ============================================================
@@ -1719,11 +1287,43 @@ def owner_system_keyboard():
 
 
 # ============================================================
-# 14. API CALL HELPER
+# 14. API CALL HELPER (with diagnostics)
 # ============================================================
 def call_api(url, query):
+    print(f"🔍 [API] {url}  ←  query={query!r}")
+
+    # ── Leakosint (POST) ──
+    if url == "https://leakosintapi.com/":
+        payload = {
+            "token": LEAKOSINT_API_KEY,
+            "request": query,
+            "limit": 100,
+            "lang": "en",
+        }
+        try:
+            r = HTTP.post(url, json=payload, timeout=(API_CONNECT, API_READ))
+            print(f"🔍 [Leakosint] HTTP {r.status_code} · {r.text[:300]}")
+            r.raise_for_status()
+            try:
+                data = r.json()
+            except ValueError:
+                return {"ok": False, "error": f"Non-JSON: {r.text[:150]}"}
+            if isinstance(data, dict) and "Error code" in data:
+                return {"ok": False, "error": f"API error: {data['Error code']}"}
+            return {"ok": True, "data": data}
+        except requests.exceptions.Timeout:
+            return {"ok": False, "error": "timeout"}
+        except requests.exceptions.HTTPError as e:
+            return {"ok": False, "error": f"HTTP {e.response.status_code}"}
+        except Exception as e:
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    # ── Generic GET ──
+    full_url = url + quote_plus(query)
     try:
-        r = HTTP.get(url + quote_plus(query), timeout=(API_CONNECT, API_READ))
+        r = HTTP.get(full_url, timeout=(API_CONNECT, API_READ))
+        print(f"🔍 [GET] {full_url}")
+        print(f"🔍 [GET] HTTP {r.status_code} · {r.text[:300]}")
         r.raise_for_status()
         try:
             return {"ok": True, "data": r.json()}
@@ -1731,8 +1331,12 @@ def call_api(url, query):
             return {"ok": True, "data": r.text[:3900]}
     except requests.exceptions.Timeout:
         return {"ok": False, "error": "timeout"}
+    except requests.exceptions.HTTPError as e:
+        return {"ok": False, "error": f"HTTP {e.response.status_code}"}
+    except requests.exceptions.ConnectionError:
+        return {"ok": False, "error": "connection failed"}
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
 def _html_escape(s):
@@ -1741,7 +1345,100 @@ def _html_escape(s):
                    .replace(">", "&gt;"))
 
 
+def _pretty_field(k):
+    return str(k).replace("_", " ").replace("-", " ").strip().title()
+
+
+def _truncate(val, n=180):
+    s = str(val).strip()
+    if len(s) <= n:
+        return s
+    return s[:n] + "…"
+
+
+def _format_leakosint_data(data):
+    if not isinstance(data, dict):
+        return f"<code>{_html_escape(str(data))[:500]}</code>"
+
+    if "Error code" in data:
+        return (f"❌ <b>API Error</b>\n"
+                f"<code>{_html_escape(data['Error code'])}</code>")
+
+    if "List" not in data:
+        return "❌ <b>No results found.</b>"
+
+    databases = data["List"]
+    real_dbs = [k for k in databases if k != "No results found"]
+    total_records = 0
+    for d in real_dbs:
+        info = databases[d] or {}
+        records = info.get("Data") or []
+        total_records += len(records)
+
+    if not real_dbs or total_records == 0:
+        return (
+            "🔍 <b>N O   R E S U L T S</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Nothing was found in any database.\n\n"
+            "💡 <i>Try a different query or format.</i>"
+        )
+
+    lines = [
+        "🔍 <b>L E A K O S I N T   R E S U L T</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"📊 <b>{len(real_dbs)}</b> database(s) · <b>{total_records}</b> record(s)",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+
+    for db_index, db_name in enumerate(real_dbs, start=1):
+        db_info = databases.get(db_name) or {}
+        records = db_info.get("Data") or []
+        info_leak = (db_info.get("InfoLeak") or "").strip()
+
+        lines.append("")
+        lines.append(f"🗂 <b>[{db_index}/{len(real_dbs)}] {_html_escape(db_name)}</b>")
+        lines.append(f"└ <i>{len(records)} record(s)</i>")
+
+        if info_leak:
+            lines.append(f"\n📝 <i>{_html_escape(_truncate(info_leak, 200))}</i>")
+
+        if not records:
+            lines.append("\n<i>(no records in this database)</i>")
+            continue
+
+        for r_index, record in enumerate(records, start=1):
+            if not isinstance(record, dict):
+                lines.append(f"\n  • <code>{_html_escape(_truncate(record))}</code>")
+                continue
+
+            clean_items = []
+            for k, v in record.items():
+                sval = "" if v is None else str(v).strip()
+                if sval and sval.lower() not in ("none", "null", "n/a", "-"):
+                    clean_items.append((k, sval))
+
+            if not clean_items:
+                lines.append(f"\n<b>📄 Record {r_index}</b> — <i>empty</i>")
+                continue
+
+            lines.append(f"\n<b>📄 Record {r_index}</b>")
+            for j, (k, v) in enumerate(clean_items):
+                prefix = "├" if j < len(clean_items) - 1 else "└"
+                field = _html_escape(_pretty_field(k))
+                value = _html_escape(_truncate(v, 200))
+                lines.append(f"{prefix} <b>{field}:</b> <code>{value}</code>")
+
+    lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append("💡 <i>Powered by LeakosintAPI</i>")
+
+    return "\n".join(lines)
+
+
 def _format_api_data(data, depth=0):
+    if isinstance(data, dict) and "List" in data:
+        return _format_leakosint_data(data)
+
     if depth > 4:
         return f"<code>{_html_escape(str(data))[:200]}</code>"
     if isinstance(data, dict):
@@ -1777,6 +1474,36 @@ def _send_long(chat_id, text, keyboard=None):
         send_message(chat_id, "✅ Finished.", keyboard)
 
 
+def _send_long_or_file(chat_id, text, keyboard=None):
+    max_len = 3900
+    if len(text) <= max_len:
+        send_message(chat_id, text, keyboard)
+        return
+
+    send_message(chat_id, text[:max_len])
+
+    try:
+        plain = (text
+                 .replace("<b>", "").replace("</b>", "")
+                 .replace("<i>", "").replace("</i>", "")
+                 .replace("<code>", "").replace("</code>", "")
+                 .replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">"))
+
+        buf = io.BytesIO(plain.encode("utf-8"))
+        url = f"{USER_TG_API}/sendDocument"
+        HTTP.post(url,
+                  data={"chat_id": chat_id,
+                        "caption": "📄 <b>Full result</b>",
+                        "parse_mode": "HTML"},
+                  files={"document": ("leakosint_result.txt", buf, "text/plain")},
+                  timeout=(10, 60))
+    except Exception as e:
+        print("send full file err:", e)
+
+    if keyboard is not None:
+        send_message(chat_id, "✅ Finished.", keyboard)
+
+
 # ============================================================
 # 15. MAINTENANCE HELPER
 # ============================================================
@@ -1789,7 +1516,67 @@ def _send_maintenance(chat_id, lang):
 
 
 # ============================================================
-# 16. USER CALLBACK HANDLER
+# 16. TOKEN STATUS PANEL
+# ============================================================
+def _human_rate(ms):
+    secs = ms / 1000.0
+    if secs < 1:
+        return f"{secs:.1f}s"
+    if secs == int(secs):
+        return f"{int(secs)}s"
+    return f"{secs:.2f}s"
+
+
+def _send_token_panel(chat_id, lang):
+    uid = chat_id
+    _ensure_user_tokens(uid)
+    tokens_apply_regen(uid)
+    rec = USER_TOKENS[uid]
+
+    bal       = rec["tokens"]
+    mx        = rec["max"]
+    rate_ms   = rec["regen_ms"]
+    refs      = rec["refs"]
+    is_inst   = tokens_has_instant(uid)
+    inst_left = tokens_instant_seconds_left(uid)
+    next_in   = tokens_next_in_seconds(uid)
+    upgraded  = rec.get("regen_upgraded", False)
+
+    filled = int((bal / mx) * 20) if mx else 0
+    filled = max(0, min(20, filled))
+    bar = "█" * filled + "░" * (20 - filled)
+
+    tier_line = ("🚀 <b>Fast Regen</b> · 0.5s/token" if upgraded
+                 else "🐢 <b>Standard Regen</b> · 3s/token")
+
+    lines = [
+        "🎟 <b>Y O U R   T O K E N S</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"🔋 Balance:  <b>{bal}</b> / <b>{mx}</b>",
+        f"<code>{bar}</code>",
+        "",
+        tier_line,
+        f"⚡ Rate:     <b>1 token / {_human_rate(rate_ms)}</b>",
+    ]
+    if next_in > 0:
+        lines.append(f"⏱ Next in:  <b>{next_in}s</b>")
+    else:
+        lines.append("✅ <i>Tank is full</i>")
+
+    if is_inst:
+        m, s = divmod(inst_left, 60)
+        lines.append(f"🚀 <b>Instant Search</b> active · {m}m {s}s left")
+
+    lines.append("")
+    lines.append(f"🎁 Referrals:   <b>{refs}</b>")
+    lines.append(f"💰 Search cost: <b>{TOKEN_CFG['search_cost']} tokens</b>")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    send_message(chat_id, "\n".join(lines), token_status_keyboard(uid, lang))
+
+
+# ============================================================
+# 17. USER CALLBACK HANDLER
 # ============================================================
 def process_callback(cb):
     data = cb.get("data", "") or ""
@@ -1800,7 +1587,6 @@ def process_callback(cb):
     cb_id = cb.get("id")
     if chat_id is None:
         return
-    # ── HARD BLOCK: only private chats ──
     if chat.get("type") != "private":
         return
     lang = get_lang(chat_id)
@@ -1885,9 +1671,107 @@ def process_callback(cb):
         send_message(chat_id, t(lang, "support"))
         return
 
+    # ── TOKEN SYSTEM CALLBACKS ──
+    if data == "tok:status":
+        answer_callback(cb_id)
+        _send_token_panel(chat_id, lang)
+        return
+
+    if data.startswith("tok:buy:"):
+        answer_callback(cb_id)
+        kind = data.split(":", 2)[2]
+
+        purchase_kb = {
+            "inline_keyboard": [
+                [{"text": "💬 Contact Support", "url": SUPPORT_URL}],
+                [{"text": "🔙 Back to Tokens", "callback_data": "tok:status"}]
+            ]
+        }
+
+        payment_notice = (
+            "⚠️ <b>Payment Notice:</b>\n"
+            "The automatic payment method is currently <b>not working</b>.\n"
+            "Please contact our support team directly to complete your purchase.\n\n"
+            f"💬 <b>Support:</b> {SUPPORT_HANDLE}"
+        )
+
+        if kind == "max":
+            price = TOKEN_CFG["price_max_upgrade"]
+            add = TOKEN_CFG["max_upgrade_add"]
+            send_message(
+                chat_id,
+                f"💠 <b>Token Capacity Upgrade</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"➕ Increase max by <b>+{add}</b> tokens\n"
+                f"🔋 One-time purchase — permanent\n"
+                f"💵 Price: <b>${price} USD</b>\n\n"
+                f"{payment_notice}",
+                purchase_kb,
+            )
+        elif kind == "regen":
+            price = TOKEN_CFG["price_regen"]
+            send_message(
+                chat_id,
+                f"⚡ <b>Regen Speed Upgrade</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"🐢 <b>Current:</b> 1 token every <b>3s</b>\n"
+                f"🚀 <b>Upgraded:</b> 1 token every <b>0.5s</b>\n"
+                f"    ↳ That's <b>6× faster</b> refilling!\n\n"
+                f"💵 Price: <b>${price} USD</b>\n\n"
+                f"{payment_notice}",
+                purchase_kb,
+            )
+        elif kind == "refill":
+            price = TOKEN_CFG["price_refill"]
+            send_message(
+                chat_id,
+                f"🔋 <b>Instant Refill</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"♻️ Fills your tokens back to <b>max instantly</b>\n"
+                f"⏱ No waiting for regen\n"
+                f"💵 Price: <b>${price} USD</b>\n\n"
+                f"{payment_notice}",
+                purchase_kb,
+            )
+        return
+
+    if data == "tok:ref":
+        answer_callback(cb_id)
+        uid = chat_id
+        _ensure_user_tokens(uid)
+        bot_un = _BOT_USERNAME_CACHE.get("username") or "YourBot"
+        link = f"https://t.me/{bot_un}?start=ref_{uid}"
+        refs = USER_TOKENS.get(uid, {}).get("refs", 0)
+        need1 = max(0, TOKEN_CFG["ref_milestone_instant"] - refs)
+        need2 = max(0, TOKEN_CFG["ref_milestone_regen"] - refs)
+
+        def _status_line(need):
+            return f"  <i>({need} more to unlock)</i>" if need > 0 else "  <i>✅ Unlocked!</i>"
+
+        text = (
+            "🎁 <b>R E F E R   &amp;   E A R N</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"👥 Your referrals: <b>{refs}</b>\n\n"
+            "🎯 <b>Reward Milestones</b>\n\n"
+            f"🚀 <b>Instant Search</b>\n"
+            f"   Invite <b>{TOKEN_CFG['ref_milestone_instant']}</b> friends → "
+            f"free instant searches for <b>{TOKEN_CFG['instant_minutes']} min</b>\n"
+            f"{_status_line(need1)}\n\n"
+            f"⚡ <b>Fast Regen Upgrade</b>\n"
+            f"   Invite <b>{TOKEN_CFG['ref_milestone_regen']}</b> friends → "
+            f"regen from 3s → <b>0.5s</b> per token\n"
+            f"{_status_line(need2)}\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🔗 <b>Your invite link:</b>\n"
+            f"<code>{link}</code>\n\n"
+            "<i>Tap the button below to copy it.</i>"
+        )
+        send_message(chat_id, text, referral_inline_keyboard(uid))
+        return
+
 
 # ============================================================
-# 17. USER MESSAGE HANDLER
+# 18. USER MESSAGE HANDLER
 # ============================================================
 def _send_feature_menu(chat_id, lang):
     send_photo(chat_id, IMAGES["osint"],
@@ -1912,8 +1796,68 @@ def _ask_bot_setup(chat_id):
     )
 
 
+def _handle_search(chat_id, lang, api_name, query):
+    """Shared search logic for both flow-state and /command paths."""
+    cfg = API_CONFIG.get(api_name)
+    if not cfg:
+        USER_STATE.pop(chat_id, None)
+        send_message(chat_id, t(lang, "select_option"), main_keyboard(lang))
+        return
+
+    # ── Reject unconfigured / placeholder APIs ──
+    if not is_feature_available(api_name):
+        USER_STATE.pop(chat_id, None)
+        send_message(chat_id, t(lang, "feature_unavailable"), main_keyboard(lang))
+        return
+
+    cost = TOKEN_CFG["search_cost"]
+    ok, new_bal, reason = tokens_spend(chat_id, cost)
+    if not ok:
+        next_in = tokens_next_in_seconds(chat_id)
+        send_message(
+            chat_id,
+            f"🪫 <b>Not enough tokens</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"🎟 Balance: <b>{new_bal}</b> / <b>{USER_TOKENS[chat_id]['max']}</b>\n"
+            f"💵 Cost per search: <b>{cost}</b>\n"
+            f"⏱ Next token in <b>{next_in}s</b>\n\n"
+            f"⚡ Tired of waiting? Tap <b>🪙 Tokens</b> below to buy a\n"
+            f"regen upgrade or instant refill.",
+            main_keyboard(lang),
+        )
+        USER_STATE.pop(chat_id, None)
+        return
+
+    send_message(chat_id, t(lang, "searching"))
+    send_chat_action(chat_id, "typing")
+    res = call_api(cfg["url"], query)
+
+    if res["ok"]:
+        body = res["data"]
+        formatted = _format_api_data(body)
+        _send_long_or_file(chat_id, formatted, main_keyboard(lang))
+        if reason != "instant":
+            rec = USER_TOKENS.get(chat_id) or {}
+            send_message(
+                chat_id,
+                f"🎟 <i>Balance: {rec.get('tokens',0)} / {rec.get('max',0)} · Cost: {cost}</i>",
+            )
+    else:
+        tokens_add(chat_id, cost)  # refund
+        err = res.get("error", "unknown")
+        send_message(
+            chat_id,
+            f"❌ <b>Search failed</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"🔧 Reason: <code>{_html_escape(err)}</code>\n\n"
+            f"♻️ Your {cost} tokens were <b>refunded</b>.\n\n"
+            f"💬 If this keeps happening, contact {SUPPORT_HANDLE}",
+            main_keyboard(lang),
+        )
+    USER_STATE.pop(chat_id, None)
+
+
 def process_update(update):
-    # ── Auto-leave if user bot was added to a group / channel ──
     if "my_chat_member" in update:
         mcm = update["my_chat_member"]
         chat = mcm.get("chat") or {}
@@ -1943,13 +1887,13 @@ def process_update(update):
     if chat_id is None:
         return
 
-    # ── HARD BLOCK: only private chats ──
     if chat.get("type") != "private":
         return
 
     user_id = msg.get("from", {}).get("id", chat_id)
 
     LAST_SEEN[chat_id] = time.time()
+    _ensure_user_tokens(chat_id)
 
     text = msg.get("text", "")
     if not isinstance(text, str):
@@ -1968,8 +1912,43 @@ def process_update(update):
         _send_maintenance(chat_id, lang)
         return
 
-    if text == "/start":
+    if text == "/start" or text.startswith("/start "):
         USER_STATE.pop(chat_id, None)
+
+        parts_start = text.split()
+        if len(parts_start) > 1 and parts_start[1].startswith("ref_"):
+            try:
+                referrer_uid = int(parts_start[1][4:])
+                if referrer_uid and referrer_uid != chat_id:
+                    ok, refs, milestone = refs_register(chat_id, referrer_uid)
+                    if ok:
+                        try:
+                            send_message(
+                                referrer_uid,
+                                f"🎉 <b>New Referral!</b>\n"
+                                f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                                f"👥 Total referrals: <b>{refs}</b>",
+                            )
+                            if milestone and isinstance(milestone, str) and milestone.startswith("instant_"):
+                                send_message(
+                                    referrer_uid,
+                                    f"🚀 <b>Milestone Unlocked!</b>\n"
+                                    f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                                    f"Instant search is now active for "
+                                    f"<b>{TOKEN_CFG['instant_minutes']} minutes</b>!",
+                                )
+                            elif milestone == "regen_upgrade":
+                                send_message(
+                                    referrer_uid,
+                                    "⚡ <b>Milestone Unlocked!</b>\n"
+                                    "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                                    "Your regen speed is now <b>0.5s/token</b> — "
+                                    "6× faster than standard!",
+                                )
+                        except Exception as e:
+                            print("referral notify err:", e)
+            except Exception as e:
+                print("ref parse err:", e)
 
         if chat_id not in USER_LANGS:
             tg_code = (msg.get("from") or {}).get("language_code", "en")
@@ -1995,6 +1974,45 @@ def process_update(update):
                 return
 
         _send_feature_menu(chat_id, lang)
+        return
+
+    # ── Token & Refer buttons ──
+    if text == "/tokens" or is_button(text, "tokens_btn", lang):
+        _send_token_panel(chat_id, lang)
+        return
+
+    if text == "/refer" or is_button(text, "refer_btn", lang):
+        process_callback({"data": "tok:ref", "message": msg, "id": None})
+        return
+
+    if text in ("/help", "/commands"):
+        help_text = (
+            "📖 <b>C O M M A N D   G U I D E</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "<b>🔍 Search Commands</b>\n"
+            "• /adhr &lt;12-digit&gt; — Aadhaar Info\n"
+            "• /num &lt;number&gt; — Phone Number Info\n"
+            "• /pan &lt;PAN&gt; — PAN Card Info\n"
+            "• /email &lt;email&gt; — Email Info\n"
+            "• /pin &lt;code&gt; — PIN Code Info\n"
+            "• /vech &lt;vehicle&gt; — Vehicle Info\n"
+            "• /ifsc &lt;code&gt; — IFSC Info\n"
+            "• /upi &lt;id&gt; — UPI Info\n"
+            "• /ip &lt;address&gt; — IP Info\n"
+            "• /tgid &lt;username&gt; — TG Username\n"
+            "• /tgid2 &lt;id&gt; — TG Chat ID\n\n"
+            "<b>🎟 Tokens &amp; Referrals</b>\n"
+            "• /tokens — View balance &amp; shop\n"
+            "• /refer — Your referral link\n\n"
+            "<b>⚙️ Other</b>\n"
+            "• /start — Restart\n"
+            "• /lang — Change language\n"
+            "• /cancel — Cancel current action\n"
+            "• /support — Contact support\n\n"
+            f"💰 <i>Each search costs {TOKEN_CFG['search_cost']} tokens</i>\n\n"
+            f"💬 <b>Support:</b> {SUPPORT_HANDLE}"
+        )
+        send_message(chat_id, help_text, main_keyboard(lang))
         return
 
     if text in ("/support", "/help_support") or is_button(text, "support_btn", lang):
@@ -2023,48 +2041,53 @@ def process_update(update):
         _send_feature_menu(chat_id, lang)
         return
 
+    # ── Flow-state search (user selected a feature, waiting for input) ──
     state = USER_STATE.get(chat_id, {})
     if state.get("flow") == "api_query":
-        api_name = state.get("api_name")
-        cfg = API_CONFIG.get(api_name)
-        if not cfg:
-            USER_STATE.pop(chat_id, None)
-            send_message(chat_id, t(lang, "select_option"), main_keyboard(lang))
-            return
-        send_message(chat_id, t(lang, "searching"))
-        res = call_api(cfg["url"], text)
-        if res["ok"]:
-            body = res["data"]
-            formatted = _format_api_data(body)
-            _send_long(chat_id, formatted, main_keyboard(lang))
-        else:
-            send_message(chat_id, t(lang, "no_result"), main_keyboard(lang))
-        USER_STATE.pop(chat_id, None)
-        return
+        is_other_action = False
+        if text.startswith("/"):
+            is_other_action = True
+        elif next((name for name in API_CONFIG if name.strip() == text.strip()), None) is not None:
+            is_other_action = True
+        elif (is_button(text, "cancel_btn", lang) or is_button(text, "lang_btn", lang) or
+              is_button(text, "support_btn", lang) or is_button(text, "tokens_btn", lang) or
+              is_button(text, "refer_btn", lang)):
+            is_other_action = True
 
+        if is_other_action:
+            USER_STATE.pop(chat_id, None)
+            # fall through to normal handlers
+        else:
+            api_name = state.get("api_name")
+            _handle_search(chat_id, lang, api_name, text)
+            return
+
+    # ── Slash command search ──
     if text.startswith("/"):
         parts = text.split(maxsplit=1)
         cmd = parts[0].lower()
         feature = COMMAND_FEATURE_MAP.get(cmd)
         if feature:
+            if not is_feature_available(feature):
+                send_message(chat_id, t(lang, "feature_unavailable"),
+                             main_keyboard(lang))
+                return
             query = parts[1].strip() if len(parts) > 1 else ""
             cfg = API_CONFIG[feature]
             if not query:
                 send_message(chat_id, f"{cfg['prompt']}\n\n{t(lang, 'send_cancel')}",
                              main_keyboard(lang))
                 return
-            send_message(chat_id, t(lang, "searching"))
-            res = call_api(cfg["url"], query)
-            if res["ok"]:
-                body = res["data"]
-                formatted = _format_api_data(body)
-                _send_long(chat_id, formatted, main_keyboard(lang))
-            else:
-                send_message(chat_id, t(lang, "no_result"), main_keyboard(lang))
+            _handle_search(chat_id, lang, feature, query)
             return
 
+    # ── Feature button (start flow) ──
     api_name = next((name for name in API_CONFIG if name.strip() == text.strip()), None)
     if api_name is not None:
+        if not is_feature_available(api_name):
+            send_message(chat_id, t(lang, "feature_unavailable"),
+                         main_keyboard(lang))
+            return
         cfg = API_CONFIG[api_name]
         USER_STATE[chat_id] = {"flow": "api_query", "api_name": api_name}
         send_message(chat_id, cfg["prompt"] + "\n\n" + t(lang, "send_cancel"),
@@ -2075,7 +2098,7 @@ def process_update(update):
 
 
 # ============================================================
-# 18. ADMIN BOT HELPERS
+# 19. ADMIN BOT HELPERS
 # ============================================================
 def admin_send_message(bot_number, chat_id, text, keyboard=None):
     api = ADMIN_TG_APIS.get(bot_number)
@@ -2126,14 +2149,16 @@ def admin_answer_callback(bot_number, cb_id, text=None):
 
 
 # ============================================================
-# 19. ADMIN CALLBACK ROUTER
+# 20. ADMIN CALLBACK ROUTER
 # ============================================================
 def _fmt_user_line(uid):
     lang = USER_LANGS.get(uid, "en")
     ban = "🚫" if uid in BANNED_USERS else ""
     seen = LAST_SEEN.get(uid)
     seen_str = time.strftime("%m-%d %H:%M", time.localtime(seen)) if seen else "—"
-    return f"🆔{ban} <code>{uid}</code> · {lang} · seen {seen_str}"
+    rec = USER_TOKENS.get(uid) or {}
+    tok = f"{rec.get('tokens', 0)}/{rec.get('max', 0)}" if rec else "—"
+    return f"🆔{ban} <code>{uid}</code> · {lang} · 🎟{tok} · seen {seen_str}"
 
 
 def _send_admin_panel(bot_number, chat_id, title=None):
@@ -2276,7 +2301,6 @@ def process_admin_callback(bot_number, cb):
         )
         return
 
-    # ══════════ OWNER FILE MANAGER CALLBACKS ══════════
     if data == "owner:files":
         if not is_owner(chat_id):
             admin_answer_callback(bot_number, cb_id, "⛔ Owner only")
@@ -2319,7 +2343,6 @@ def process_admin_callback(bot_number, cb):
         admin_answer_callback(bot_number, cb_id)
         _owner_download_all(bot_number, chat_id)
         return
-    # ═══════════════════════════════════════════════════════
 
     if data == "owner:back":
         if not is_owner(chat_id):
@@ -2410,8 +2433,9 @@ def process_admin_callback(bot_number, cb):
                            f"🟢 Seen (24h): <b>{seen24}</b>\n"
                            f"🚫 Banned: <b>{len(BANNED_USERS)}</b>\n"
                            f"🛡 Admins: <b>{len(DYNAMIC_ADMINS)}</b>\n"
+                           f"🎟 Token records: <b>{len(USER_TOKENS)}</b>\n"
+                           f"🎁 Referrals: <b>{len(REF_INDEX)}</b>\n"
                            f"🛠 Maintenance: <b>{'ON' if MAINTENANCE_MODE else 'OFF'}</b>\n"
-                           f"🆓 Mode: <b>FREE</b>\n"
                            f"━━━━━━━━━━━━━━━━━━━━━━━━━",
                            build_admin_main_keyboard(is_owner(chat_id)))
         return
@@ -2421,8 +2445,7 @@ def process_admin_callback(bot_number, cb):
         admin_send_message(bot_number, chat_id,
                            f"🆔 <code>{chat_id}</code>\n"
                            f"🏷 Role: <b>{role_badge(chat_id)}</b>\n"
-                           f"🛠 Maintenance: <b>{'ON' if MAINTENANCE_MODE else 'OFF'}</b>\n"
-                           f"🆓 Mode: <b>FREE</b>",
+                           f"🛠 Maintenance: <b>{'ON' if MAINTENANCE_MODE else 'OFF'}</b>",
                            build_admin_main_keyboard(is_owner(chat_id)))
         return
 
@@ -2439,7 +2462,7 @@ def process_admin_callback(bot_number, cb):
 
 
 # ============================================================
-# 20. ADMIN COMMAND HANDLER
+# 21. ADMIN COMMAND HANDLER
 # ============================================================
 def process_admin_command(bot_number, chat_id, text, message):
     global CURRENT_PASSWORD, MAINTENANCE_MODE
@@ -2455,6 +2478,10 @@ def process_admin_command(bot_number, chat_id, text, message):
                            "/msg ID TEXT\n\n"
                            "<b>Notes</b>\n"
                            "/note ID TEXT · /notes ID · /delnote ID N\n\n"
+                           "<b>🎟 Tokens</b>\n"
+                           "/tokens ID · /give_tokens ID N\n"
+                           "/upgrade_regen ID · /upgrade_max ID\n"
+                           "/grant_instant ID [min]\n\n"
                            "<b>Reports</b>\n"
                            "/list · /stats · /online · /logs · /export\n\n"
                            "<b>Owner only</b>\n"
@@ -2497,15 +2524,13 @@ def process_admin_command(bot_number, chat_id, text, message):
         admin_send_message(bot_number, chat_id,
                            f"🆔 <code>{chat_id}</code>\n"
                            f"🏷 Role: <b>{role_badge(chat_id)}</b>\n"
-                           f"🛠 Maintenance: <b>{'ON' if MAINTENANCE_MODE else 'OFF'}</b>\n"
-                           f"🆓 Mode: <b>FREE</b>",
+                           f"🛠 Maintenance: <b>{'ON' if MAINTENANCE_MODE else 'OFF'}</b>",
                            build_admin_main_keyboard(is_owner(chat_id)))
         return
 
     if cmd == "/logout":
         if is_owner(chat_id):
-            admin_send_message(bot_number, chat_id,
-                               "❌ Owner can't logout.",
+            admin_send_message(bot_number, chat_id, "❌ Owner can't logout.",
                                build_admin_main_keyboard(is_owner(chat_id)))
             return
         DYNAMIC_ADMINS.discard(chat_id); save_admins()
@@ -2606,14 +2631,18 @@ def process_admin_command(bot_number, chat_id, text, message):
         try:
             buf = io.StringIO()
             w = csv.writer(buf)
-            w.writerow(["user_id", "lang", "banned", "last_seen", "notes"])
+            w.writerow(["user_id", "lang", "banned", "last_seen", "notes",
+                        "tokens", "max", "refs", "instant_until"])
             for uid in sorted(LAST_SEEN.keys()):
                 lang = USER_LANGS.get(uid, "en")
                 banned = "yes" if uid in BANNED_USERS else "no"
                 seen = LAST_SEEN.get(uid)
                 seen_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(seen)) if seen else ""
                 notes = " | ".join(n["text"] for n in USER_NOTES.get(uid, []))
-                w.writerow([uid, lang, banned, seen_str, notes])
+                rec = USER_TOKENS.get(uid, {})
+                w.writerow([uid, lang, banned, seen_str, notes,
+                            rec.get("tokens", ""), rec.get("max", ""),
+                            rec.get("refs", ""), rec.get("instant_until", "")])
             content = buf.getvalue()
             tmp_path = "/tmp/export_users.csv"
             with open(tmp_path, "w", encoding="utf-8") as f:
@@ -2631,6 +2660,112 @@ def process_admin_command(bot_number, chat_id, text, message):
                                build_admin_main_keyboard(is_owner(chat_id)))
         return
 
+    # ── TOKEN ADMIN COMMANDS ──
+    if cmd == "/tokens":
+        if len(args) != 2:
+            admin_send_message(bot_number, chat_id, "Usage: /tokens USER_ID",
+                               build_admin_main_keyboard(is_owner(chat_id)))
+            return
+        try:
+            target = int(args[1])
+        except ValueError:
+            admin_send_message(bot_number, chat_id, "❌ Invalid ID.",
+                               build_admin_main_keyboard(is_owner(chat_id)))
+            return
+        _ensure_user_tokens(target)
+        tokens_apply_regen(target)
+        rec = USER_TOKENS[target]
+        instant_line = "—"
+        if rec["instant_until"] > time.time():
+            instant_line = time.strftime("%Y-%m-%d %H:%M",
+                                          time.localtime(rec["instant_until"]))
+        tier = "🚀 Fast (0.5s)" if rec["regen_upgraded"] else "🐢 Standard (3s)"
+        admin_send_message(bot_number, chat_id,
+                           f"🎟 <b>Tokens — <code>{target}</code></b>\n"
+                           f"Balance: <b>{rec['tokens']} / {rec['max']}</b>\n"
+                           f"Regen tier: <b>{tier}</b>\n"
+                           f"Referrals: <b>{rec['refs']}</b>\n"
+                           f"Instant until: <code>{instant_line}</code>",
+                           build_admin_main_keyboard(is_owner(chat_id)))
+        return
+
+    if cmd == "/give_tokens":
+        if len(args) != 3:
+            admin_send_message(bot_number, chat_id, "Usage: /give_tokens USER_ID AMOUNT",
+                               build_admin_main_keyboard(is_owner(chat_id)))
+            return
+        try:
+            target = int(args[1]); amount = int(args[2])
+        except ValueError:
+            admin_send_message(bot_number, chat_id, "❌ Invalid args.",
+                               build_admin_main_keyboard(is_owner(chat_id)))
+            return
+        new_bal = tokens_add(target, amount)
+        log_admin(chat_id, "give_tokens", f"{target} +{amount}")
+        admin_send_message(bot_number, chat_id,
+                           f"✅ Added {amount} tokens to <code>{target}</code>.\n"
+                           f"New balance: <b>{new_bal}</b>",
+                           build_admin_main_keyboard(is_owner(chat_id)))
+        return
+
+    if cmd == "/upgrade_regen":
+        if len(args) != 2:
+            admin_send_message(bot_number, chat_id, "Usage: /upgrade_regen USER_ID",
+                               build_admin_main_keyboard(is_owner(chat_id)))
+            return
+        try:
+            target = int(args[1])
+        except ValueError:
+            admin_send_message(bot_number, chat_id, "❌ Invalid ID.",
+                               build_admin_main_keyboard(is_owner(chat_id)))
+            return
+        done, new_ms = tokens_upgrade_regen(target)
+        log_admin(chat_id, "upgrade_regen", target)
+        msg_out = (f"✅ Regen upgraded for <code>{target}</code> → "
+                   f"<b>1 / {_human_rate(new_ms)}</b>."
+                   if done else
+                   f"ℹ️ <code>{target}</code> already upgraded.")
+        admin_send_message(bot_number, chat_id, msg_out,
+                           build_admin_main_keyboard(is_owner(chat_id)))
+        return
+
+    if cmd == "/upgrade_max":
+        if len(args) != 2:
+            admin_send_message(bot_number, chat_id, "Usage: /upgrade_max USER_ID",
+                               build_admin_main_keyboard(is_owner(chat_id)))
+            return
+        try:
+            target = int(args[1])
+        except ValueError:
+            admin_send_message(bot_number, chat_id, "❌ Invalid ID.",
+                               build_admin_main_keyboard(is_owner(chat_id)))
+            return
+        new_max = tokens_extend_max(target, TOKEN_CFG["max_upgrade_add"])
+        log_admin(chat_id, "upgrade_max", target)
+        admin_send_message(bot_number, chat_id,
+                           f"✅ Max tokens for <code>{target}</code> is now <b>{new_max}</b>.",
+                           build_admin_main_keyboard(is_owner(chat_id)))
+        return
+
+    if cmd == "/grant_instant":
+        if len(args) < 2:
+            admin_send_message(bot_number, chat_id, "Usage: /grant_instant USER_ID [MINUTES]",
+                               build_admin_main_keyboard(is_owner(chat_id)))
+            return
+        try:
+            target = int(args[1])
+            minutes = int(args[2]) if len(args) > 2 else TOKEN_CFG["instant_minutes"]
+        except ValueError:
+            admin_send_message(bot_number, chat_id, "❌ Invalid.",
+                               build_admin_main_keyboard(is_owner(chat_id)))
+            return
+        tokens_grant_instant(target, minutes)
+        log_admin(chat_id, "grant_instant", f"{target} +{minutes}m")
+        admin_send_message(bot_number, chat_id,
+                           f"🚀 Instant search granted to <code>{target}</code> for {minutes} min.",
+                           build_admin_main_keyboard(is_owner(chat_id)))
+        return
+
     if cmd in ("/check", "/role"):
         if len(args) != 2:
             admin_send_message(bot_number, chat_id, f"Usage: {cmd} USER_ID",
@@ -2646,20 +2781,18 @@ def process_admin_command(bot_number, chat_id, text, message):
         ban_line = (f"🚫 Banned — {ban_info.get('reason','—')}"
                     if ban_info else "🟢 Not banned")
         seen_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(seen)) if seen else "—"
-        notes = USER_NOTES.get(target, [])
-        note_block = ""
-        if notes:
-            note_block = "\n\n📝 <b>NOTES</b>\n" + "\n".join(
-                f"{i + 1}. {n['text']}" for i, n in enumerate(notes[-5:]))
+        rec = USER_TOKENS.get(target) or {}
+        tok_line = f"🎟 Tokens: <b>{rec.get('tokens', 0)} / {rec.get('max', 0)}</b>"
+        ref_line = f"🎁 Referrals: <b>{rec.get('refs', 0)}</b>"
         admin_send_message(bot_number, chat_id,
                            f"👤 <b>USER INFO</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                            f"🆔 <code>{target}</code>\n"
                            f"🏷 Role: <b>{role_badge(target)}</b>\n"
                            f"🌐 Lang: {lang}\n"
-                           f"🆓 Access: <b>FREE</b>\n"
+                           f"{tok_line}\n"
+                           f"{ref_line}\n"
                            f"{ban_line}\n"
-                           f"👀 Last seen: {seen_str}"
-                           f"{note_block}\n━━━━━━━━━━━━━━━━━━━━━━━━━",
+                           f"👀 Last seen: {seen_str}\n━━━━━━━━━━━━━━━━━━━━━━━━━",
                            build_admin_main_keyboard(is_owner(chat_id)))
         return
 
@@ -2790,12 +2923,11 @@ def process_admin_command(bot_number, chat_id, text, message):
 
 
 # ============================================================
-# 21. ADMIN UPDATE ROUTER
+# 22. ADMIN UPDATE ROUTER
 # ============================================================
 def process_admin_update(bot_number, update):
     global CURRENT_PASSWORD
 
-    # ── Auto-leave if admin bot added to a group / channel ──
     if "my_chat_member" in update:
         mcm = update["my_chat_member"]
         chat = mcm.get("chat") or {}
@@ -2805,7 +2937,6 @@ def process_admin_update(bot_number, update):
                 leave_admin_chat(chat.get("id"))
         return
 
-    # ── HARD BLOCK: only private chats ──
     msg_for_type = (update.get("message") or
                     (update.get("callback_query") or {}).get("message") or {})
     chat_type = (msg_for_type.get("chat") or {}).get("type")
@@ -2825,6 +2956,31 @@ def process_admin_update(bot_number, update):
     text = text_raw.strip() if isinstance(text_raw, str) else ""
 
     if not is_admin(chat_id):
+
+        # ── 1) If user is locked out, block everything except /start-style info ──
+        remaining = login_lock_remaining(chat_id)
+        if remaining > 0:
+            if text in ("/start", "/help", "/whoami", "/id"):
+                admin_send_message(
+                    bot_number, chat_id,
+                    f"🔐 <b>Admin Bot</b>\n\n"
+                    f"🆔 Your Chat ID: <code>{chat_id}</code>\n\n"
+                    f"🚫 <b>Too many wrong passwords.</b>\n"
+                    f"⏳ Try again in <b>{_fmt_duration(remaining)}</b>."
+                )
+                return
+            # any attempt (including a correct password) is refused during lockout
+            admin_send_message(
+                bot_number, chat_id,
+                f"🚫 <b>Login temporarily blocked</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"You entered the wrong admin password too many times.\n\n"
+                f"⏳ You can retry in <b>{_fmt_duration(remaining)}</b>.\n\n"
+                f"💬 Need help? Contact the owner."
+            )
+            return
+
+        # ── 2) Info commands ──
         if text in ("/start", "/help", "/whoami", "/id"):
             admin_send_message(bot_number, chat_id,
                                f"🔐 <b>Admin Bot</b>\n\n"
@@ -2833,6 +2989,8 @@ def process_admin_update(bot_number, update):
                                f"💡 Owner: set OWNER_ID=<code>{chat_id}</code> in env "
                                f"to auto-login.")
             return
+
+        # ── 3) /login PASSWORD ──
         if text.startswith("/login"):
             parts = text.split(maxsplit=1)
             if len(parts) != 2 or not parts[1].strip():
@@ -2841,21 +2999,47 @@ def process_admin_update(bot_number, update):
                 return
             supplied = parts[1].strip()
             if supplied == CURRENT_PASSWORD or supplied in (ADMIN_BOT_TOKEN, USER_BOT_TOKEN):
+                login_clear(chat_id)
                 DYNAMIC_ADMINS.add(chat_id); save_admins()
                 log_admin(chat_id, "login")
                 admin_send_message(bot_number, chat_id,
                                    f"✅ <b>Login OK.</b>\n🏷 Role: <b>{role_badge(chat_id)}</b>",
                                    build_admin_main_keyboard(is_owner(chat_id)))
+                return
+            locked, secs = login_register_failure(chat_id)
+            if locked:
+                admin_send_message(
+                    bot_number, chat_id,
+                    f"❌ <b>Incorrect password.</b>\n\n"
+                    f"🚫 You are now locked out for <b>{_fmt_duration(secs)}</b>.\n"
+                    f"Please try again later."
+                )
             else:
                 admin_send_message(bot_number, chat_id, "❌ Incorrect password.")
             return
+
+        # ── 4) Bare password as message ──
         if text and text == CURRENT_PASSWORD:
+            login_clear(chat_id)
             DYNAMIC_ADMINS.add(chat_id); save_admins()
             log_admin(chat_id, "login (bare)")
             admin_send_message(bot_number, chat_id,
                                f"✅ <b>Login OK.</b>\n🏷 Role: <b>{role_badge(chat_id)}</b>",
                                build_admin_main_keyboard(is_owner(chat_id)))
             return
+
+        # Bare wrong text — treat as a failed login attempt too
+        if text and not text.startswith("/") and len(text) <= 128:
+            locked, secs = login_register_failure(chat_id)
+            if locked:
+                admin_send_message(
+                    bot_number, chat_id,
+                    f"❌ <b>Incorrect password.</b>\n\n"
+                    f"🚫 You are now locked out for <b>{_fmt_duration(secs)}</b>.\n"
+                    f"Please try again later."
+                )
+                return
+
         admin_send_message(bot_number, chat_id,
                            f"⛔ Not authorized.\n🆔 Your ID: <code>{chat_id}</code>\n\n"
                            f"Send <code>/login YOUR_PASSWORD</code>.")
@@ -2993,7 +3177,7 @@ def admin_bot_loop(bot_number):
 
 
 # ============================================================
-# 22. USER BOT POLLING
+# 23. USER BOT POLLING
 # ============================================================
 def clear_webhook(api_base, label):
     try:
@@ -3039,7 +3223,7 @@ def user_bot_loop():
 
 
 # ============================================================
-# 23. SELF-PING
+# 24. SELF-PING
 # ============================================================
 def self_ping_loop():
     if not SELF_URL or not SELF_URL.startswith("http"):
@@ -3058,7 +3242,7 @@ def self_ping_loop():
 
 
 # ============================================================
-# 24. BOOTSTRAP
+# 25. BOOTSTRAP
 # ============================================================
 def _hook_health_runtime():
     _RUNTIME["total_users"]  = lambda: len(LAST_SEEN)
@@ -3071,7 +3255,6 @@ def main():
         print("ERROR: USER_BOT_TOKEN missing.")
         return
 
-    # 🆕 Ensure all JSON files exist before loading them
     ensure_json_files()
 
     load_password()
@@ -3081,6 +3264,8 @@ def main():
     load_log()
     load_lastseen()
     load_langs()
+    load_tokens()
+    load_login_attempts()
     _hook_health_runtime()
 
     threading.Thread(target=run_flask, daemon=True).start()
@@ -3091,6 +3276,7 @@ def main():
         if not info.get("ok"):
             print("ERROR: Invalid USER token.")
             return
+        _BOT_USERNAME_CACHE["username"] = info["result"]["username"]
         print("✅ USER bot:", info["result"]["username"])
     except Exception as e:
         print("USER bot connect error:", e)
@@ -3119,8 +3305,18 @@ def main():
     threading.Thread(target=self_ping_loop, daemon=True).start()
 
     print("=" * 60)
-    print("FREE bot started · owner:", OWNER_ID or "(unset)")
+    print("Bot started · owner:", OWNER_ID or "(unset)")
     print("Support:", SUPPORT_HANDLE)
+    print(f"🎟 Token system: {TOKEN_CFG['start_balance']}/{TOKEN_CFG['default_max']} · "
+          f"cost {TOKEN_CFG['search_cost']} · "
+          f"searches/tank {TOKEN_CFG['default_max'] // TOKEN_CFG['search_cost']}")
+    print(f"   · regen default {_human_rate(TOKEN_CFG['default_regen_ms'])} · "
+          f"upgraded {_human_rate(TOKEN_CFG['upgraded_regen_ms'])}")
+    print(f"🎁 Referrals: {TOKEN_CFG['ref_milestone_instant']} refs → "
+          f"{TOKEN_CFG['instant_minutes']}min instant · "
+          f"{TOKEN_CFG['ref_milestone_regen']} refs → fast regen")
+    print(f"🆓 Free-mode token gate: ON · Admins: {len(DYNAMIC_ADMINS)} · "
+          f"Banned: {len(BANNED_USERS)}")
     print("=" * 60)
 
     user_bot_loop()

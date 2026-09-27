@@ -1088,8 +1088,10 @@ def get_chat_member(chat_id, user_id):
         r = HTTP.get(f"{USER_TG_API}/getChatMember",
                      params={"chat_id": chat_id, "user_id": user_id},
                      timeout=(5, 10))
-        r.raise_for_status()
-        return r.json()
+        data = r.json()
+        if not data.get("ok"):
+            print(f"⚠️ getChatMember error ({chat_id}): {data.get('description')}")
+        return data
     except Exception as e:
         print("getChatMember err:", e)
         return None
@@ -1150,14 +1152,18 @@ def _bot_in_communities():
 def check_user_joined(user_id):
     if not FORCE_JOIN_ENABLED:
         return True, "disabled"
-    if not _bot_in_communities():
-        return False, "bot_not_member"
+    
+    # Removed _bot_in_communities() check here to allow users to see join buttons
+    # even if the bot isn't an admin yet.
+    
     if JOIN_GROUP_CHAT_ID:
         if not _is_member_status(get_chat_member(JOIN_GROUP_CHAT_ID, user_id)):
             return False, "group"
+            
     if JOIN_CHANNEL_CHAT_ID:
         if not _is_member_status(get_chat_member(JOIN_CHANNEL_CHAT_ID, user_id)):
             return False, "channel"
+            
     return True, "ok"
 
 
@@ -1639,10 +1645,7 @@ def process_callback(cb):
             if FORCE_JOIN_ENABLED and get_role(chat_id) == "user":
                 ok, reason = check_user_joined(chat_id)
                 if not ok:
-                    if reason == "bot_not_member":
-                        _ask_bot_setup(chat_id)
-                    else:
-                        _ask_for_join(chat_id, code)
+                    _ask_for_join(chat_id, code)
                     return
 
             _send_feature_menu(chat_id, code)
@@ -1651,10 +1654,6 @@ def process_callback(cb):
     if data == "user:continue":
         ok, reason = check_user_joined(chat_id)
         if not ok:
-            if reason == "bot_not_member":
-                answer_callback(cb_id, "Bot setup incomplete")
-                _ask_bot_setup(chat_id)
-                return
             answer_callback(cb_id, t(lang, "join_fail"))
             send_photo(chat_id, IMAGES["join"],
                        caption=t(lang, "join_required"),
@@ -1807,8 +1806,10 @@ def _ask_bot_setup(chat_id):
         chat_id,
         "⚠️ <b>Bot Setup Required</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "The bot is <b>not yet a member</b> of the channel / group.\n\n"
-        "👉 Please add the bot to both, then send /start again.\n\n"
+        "The bot is <b>not yet a member / admin</b> of the channel / group.\n\n"
+        "👉 Please add the bot to both and make it an <b>Administrator</b> "
+        "with the right to manage members.\n\n"
+        "After adding it as an Administrator, send /start again.\n\n"
         "💬 <b>Support:</b> @Tony_M_unlock",
     )
 
@@ -1984,10 +1985,7 @@ def process_update(update):
         if FORCE_JOIN_ENABLED and get_role(chat_id) == "user":
             ok, reason = check_user_joined(user_id)
             if not ok:
-                if reason == "bot_not_member":
-                    _ask_bot_setup(chat_id)
-                else:
-                    _ask_for_join(chat_id, lang)
+                _ask_for_join(chat_id, lang)
                 return
 
         _send_feature_menu(chat_id, lang)
@@ -2047,10 +2045,7 @@ def process_update(update):
         ok, reason = check_user_joined(user_id)
         if not ok:
             USER_STATE.pop(chat_id, None)
-            if reason == "bot_not_member":
-                _ask_bot_setup(chat_id)
-            else:
-                _ask_for_join(chat_id, lang)
+            _ask_for_join(chat_id, lang)
             return
 
     if text == "/cancel" or is_button(text, "cancel_btn", lang):
@@ -3309,8 +3304,9 @@ def main():
     if FORCE_JOIN_ENABLED:
         print("🔒 Force-join is ENABLED")
         if not _bot_in_communities():
-            print("⚠️ Bot is NOT a member of group and/or channel. "
-                  "Add it as admin/member to both.")
+            print(f"⚠️ Bot is NOT a member/admin of group ({JOIN_GROUP_CHAT_ID}) and/or channel ({JOIN_CHANNEL_CHAT_ID}).")
+            print("   Please add the bot to both and promote it to Administrator.")
+            print("   Check the logs for getChatMember errors if it is already added.")
 
     threading.Thread(target=admin_bot_loop, args=(1,), daemon=True).start()
     threading.Thread(target=self_ping_loop, daemon=True).start()

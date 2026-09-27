@@ -3,6 +3,7 @@ import io
 import csv
 import json
 import time
+import re
 import threading
 import traceback
 import zipfile
@@ -123,11 +124,6 @@ IMAGES = {
 IMAGE_CACHE = {}
 
 # ── Token system configuration ──
-# Economy:
-#   • 480 tokens on a full tank
-#   • 40 tokens per search  →  exactly 12 searches on a full tank
-#   • default regen = 3s/token (slow, ~24 min to refill from empty)
-#   • upgraded regen = 0.5s/token (6× faster, paid upgrade or 30 refs)
 TOKEN_CFG = {
     "start_balance":     int(_env("TOKEN_START",          "480")),
     "default_max":       int(_env("TOKEN_DEFAULT_MAX",    "480")),
@@ -185,7 +181,7 @@ HTTP       = _make_session(20, 50)
 ADMIN_HTTP = _make_session(10, 20)
 
 TG_CONNECT, TG_READ   = 5, 35
-API_CONNECT, API_READ = 5, 30   # bumped for slow APIs like Render / Netlify cold starts
+API_CONNECT, API_READ = 5, 30
 
 USER_TG_API   = f"https://api.telegram.org/bot{USER_BOT_TOKEN}"
 ADMIN_TG_APIS = {1: f"https://api.telegram.org/bot{ADMIN_BOT_TOKEN}"}
@@ -958,6 +954,11 @@ def is_feature_available(api_name):
 # ============================================================
 # 10. TELEGRAM HELPERS
 # ============================================================
+def _strip_html(text):
+    """Remove HTML tags so we can send clean plain text if HTML parsing fails."""
+    return re.sub(r"<[^>]+>", "", text or "")
+
+
 def send_message(chat_id, text, keyboard=None, parse_mode="HTML"):
     url = f"{USER_TG_API}/sendMessage"
     data = {"chat_id": chat_id, "text": text}
@@ -971,6 +972,8 @@ def send_message(chat_id, text, keyboard=None, parse_mode="HTML"):
         return r.json()
     except requests.exceptions.HTTPError as e:
         if e.response is not None and e.response.status_code == 400 and "parse" in e.response.text.lower():
+            # Fallback: strip HTML and send as plain text (avoids ugly raw tags)
+            data["text"] = _strip_html(text)
             data.pop("parse_mode", None)
             try:
                 r = HTTP.post(url, data=data, timeout=(TG_CONNECT, TG_READ))
@@ -1475,27 +1478,41 @@ def _send_long(chat_id, text, keyboard=None):
 
 
 def _send_long_or_file(chat_id, text, keyboard=None):
+    """
+    Send result in chat if short.
+    If long → send first 3900 chars in chat, rest as a .txt file (with HTML stripped).
+    This prevents broken HTML tags showing up in the chat.
+    """
     max_len = 3900
     if len(text) <= max_len:
         send_message(chat_id, text, keyboard)
         return
 
-    send_message(chat_id, text[:max_len])
+    # 1) Send first slice as a preview (valid HTML)
+    preview = text[:max_len]
+    # Make sure we don't cut off in the middle of a tag
+    last_open = preview.rfind("<")
+    last_close = preview.rfind(">")
+    if last_open > last_close:
+        preview = preview[:last_open]
+    send_message(chat_id, preview)
 
+    # 2) Send the full result as a plain-text file
     try:
         plain = (text
                  .replace("<b>", "").replace("</b>", "")
                  .replace("<i>", "").replace("</i>", "")
                  .replace("<code>", "").replace("</code>", "")
+                 .replace("<pre>", "").replace("</pre>", "")
                  .replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">"))
 
         buf = io.BytesIO(plain.encode("utf-8"))
         url = f"{USER_TG_API}/sendDocument"
         HTTP.post(url,
                   data={"chat_id": chat_id,
-                        "caption": "📄 <b>Full result</b>",
+                        "caption": "📄 <b>Full result (plain text)</b>",
                         "parse_mode": "HTML"},
-                  files={"document": ("leakosint_result.txt", buf, "text/plain")},
+                  files={"document": ("osint_result.txt", buf, "text/plain")},
                   timeout=(10, 60))
     except Exception as e:
         print("send full file err:", e)
@@ -2957,7 +2974,6 @@ def process_admin_update(bot_number, update):
 
     if not is_admin(chat_id):
 
-        # ── 1) If user is locked out, block everything except /start-style info ──
         remaining = login_lock_remaining(chat_id)
         if remaining > 0:
             if text in ("/start", "/help", "/whoami", "/id"):
@@ -2969,7 +2985,6 @@ def process_admin_update(bot_number, update):
                     f"⏳ Try again in <b>{_fmt_duration(remaining)}</b>."
                 )
                 return
-            # any attempt (including a correct password) is refused during lockout
             admin_send_message(
                 bot_number, chat_id,
                 f"🚫 <b>Login temporarily blocked</b>\n"
@@ -2980,7 +2995,6 @@ def process_admin_update(bot_number, update):
             )
             return
 
-        # ── 2) Info commands ──
         if text in ("/start", "/help", "/whoami", "/id"):
             admin_send_message(bot_number, chat_id,
                                f"🔐 <b>Admin Bot</b>\n\n"
@@ -2990,7 +3004,6 @@ def process_admin_update(bot_number, update):
                                f"to auto-login.")
             return
 
-        # ── 3) /login PASSWORD ──
         if text.startswith("/login"):
             parts = text.split(maxsplit=1)
             if len(parts) != 2 or not parts[1].strip():
@@ -3018,7 +3031,6 @@ def process_admin_update(bot_number, update):
                 admin_send_message(bot_number, chat_id, "❌ Incorrect password.")
             return
 
-        # ── 4) Bare password as message ──
         if text and text == CURRENT_PASSWORD:
             login_clear(chat_id)
             DYNAMIC_ADMINS.add(chat_id); save_admins()
@@ -3028,7 +3040,6 @@ def process_admin_update(bot_number, update):
                                build_admin_main_keyboard(is_owner(chat_id)))
             return
 
-        # Bare wrong text — treat as a failed login attempt too
         if text and not text.startswith("/") and len(text) <= 128:
             locked, secs = login_register_failure(chat_id)
             if locked:

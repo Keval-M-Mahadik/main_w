@@ -6,6 +6,7 @@ import time
 import threading
 import traceback
 import zipfile
+import re
 
 from io import BytesIO
 from urllib.parse import quote_plus
@@ -186,15 +187,18 @@ SUBSCRIPTION_PLANS = {
 FIELD_EMOJI = {
     # Identity
     "name": "👤", "full_name": "👤", "first_name": "👤", "last_name": "👤",
+    "fathername": "👨", "mothername": "👩", "nickname": "🏷️",
     "username": "🏷️", "user_id": "🆔", "id": "🆔", "chat_id": "🆔",
     "phone": "📞", "mobile": "📞", "phone_number": "📞", "contact": "📞",
+    "phone2": "📞", "phone3": "📞", "mobilephone": "📞",
     "email": "📧", "mail": "📧",
-    "pan": "🆔", "aadhaar": "🪪", "aadhar": "🪪",
+    "pan": "🆔", "pan_code": "🆔", "aadhaar": "🪪", "aadhar": "🪪",
     "gender": "⚧️", "age": "🎂", "dob": "🎂", "birthdate": "🎂",
+    "bday": "🎂", "docnumber": "📋",
 
     # Location
-    "address": "📍", "city": "🏙️", "state": "🏛️", "country": "🌍",
-    "district": "🗺️", "pincode": "📮", "postal": "📮", "zip": "📮",
+    "address": "📍", "address2": "📍", "city": "🏙️", "state": "🏛️", "country": "🌍",
+    "district": "🗺️", "pincode": "📮", "postal": "📮", "zip": "📮", "postcode": "📮",
     "latitude": "🧭", "longitude": "🧭", "continent": "🌍", "region": "🗺️",
 
     # Network / IP
@@ -211,7 +215,7 @@ FIELD_EMOJI = {
     # Vehicle
     "vehicle": "🚘", "vehicle_no": "🚘", "maker": "🏢", "model": "🚗",
     "fuel": "⛽", "color": "🎨", "chassis": "📋", "engine": "🔧",
-    "reg_date": "📅", "insurance": "📄", "fitness": "✅",
+    "reg_date": "📅", "regdate": "📅", "insurance": "📄", "fitness": "✅",
     "financer": "🏦", "owner": "👑", "owner_name": "👑",
 
     # Telegram
@@ -235,7 +239,7 @@ def _emoji_for(key):
 
 
 # ── HTML report cache ──
-REPORT_CACHE = {}          # {report_id: {"uid": int, "html": str, "title": str, "ts": float}}
+REPORT_CACHE = {}
 REPORT_TTL   = 3600
 DOWNLOAD_THRESHOLD = 15
 PREVIEW_PER_DB     = 3
@@ -1051,7 +1055,15 @@ def is_feature_available(api_name):
 # ============================================================
 # 10. TELEGRAM HELPERS
 # ============================================================
+_TAG_RE = re.compile(r"</?(b|i|u|s|code|pre|a|tg-spoiler|strong|em|ins|strike|del)(\s[^>]*)?>")
+
+
 def send_message(chat_id, text, keyboard=None, parse_mode="HTML"):
+    # ── Safety net: if message has too many tags, strip them all ──
+    if parse_mode == "HTML" and text.count("<") > 80:
+        text = _TAG_RE.sub("", text)
+        text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+
     url = f"{USER_TG_API}/sendMessage"
     data = {"chat_id": chat_id, "text": text}
     if parse_mode:
@@ -1399,7 +1411,6 @@ def call_api(url, query):
     print(f"🔍 [API] {url}  ←  query={query!r}")
 
     if url == "https://leakosintapi.com/":
-        # ✅ Strip "+" and spaces — Leakosint rejects some formatted inputs
         clean_query = query.replace("+", "").replace(" ", "").strip()
 
         payload = {
@@ -1422,7 +1433,6 @@ def call_api(url, query):
         except requests.exceptions.Timeout:
             return {"ok": False, "error": "timeout"}
         except requests.exceptions.HTTPError as e:
-            # ✅ Show the real API message, not just "HTTP 400"
             detail = ""
             try:
                 err_body = e.response.json()
@@ -1480,7 +1490,7 @@ def _truncate(val, n=180):
 
 
 # ============================================================
-# 14b. HTML REPORT BUILDER
+# 14b. HTML REPORT BUILDER (for the download button)
 # ============================================================
 def _build_html_report(data, query, uid):
     import datetime, html as _html
@@ -1627,24 +1637,24 @@ def _gc_reports():
 
 
 # ============================================================
-# 14c. FORMATTERS
+# 14c. FORMATTERS — Plain-text (no HTML tags → no raw tag bug)
 # ============================================================
 def _format_leakosint_data(data):
     if not isinstance(data, dict):
-        return f"<code>{_html_escape(str(data))[:500]}</code>"
+        return f"{str(data)[:500]}"
 
     if "Error code" in data:
-        return (f"❌⚠️ <b>S E A R C H   F A I L E D</b> ⚠️❌\n"
+        return (f"❌⚠️ S E A R C H   F A I L E D ⚠️❌\n"
                 f"═══════════════════════════════════════\n"
-                f"🔧 <b>API Error:</b>\n"
-                f"<code>{_html_escape(data['Error code'])}</code>")
+                f"🔧 API Error:\n"
+                f"{data['Error code']}")
 
     if "List" not in data:
-        return ("🔍😶 <b>N O   R E S U L T S</b> 😶🔍\n"
+        return ("🔍😶 N O   R E S U L T S 😶🔍\n"
                 "═══════════════════════════════════════\n\n"
                 "🗂️ Databases searched : 🔢 0\n"
                 "📄 Records found      : 🔢 0\n\n"
-                "💡 <i>Try a different query or format.</i>")
+                "💡 Try a different query or format.")
 
     databases = data["List"]
     real_dbs = [k for k in databases if k != "No results found"]
@@ -1654,21 +1664,22 @@ def _format_leakosint_data(data):
         total_records += len(info.get("Data") or [])
 
     if not real_dbs or total_records == 0:
-        return ("🔍😶 <b>N O   R E S U L T S</b> 😶🔍\n"
+        return ("🔍😶 N O   R E S U L T S 😶🔍\n"
                 "═══════════════════════════════════════\n\n"
                 "🗂️ Databases searched : 🔢 0\n"
                 "📄 Records found      : 🔢 0\n\n"
-                "💡 <i>Try a different query or format.</i>")
+                "💡 Try a different query or format.")
 
+    # Header — only a couple of safe tags
     lines = [
         "🔍✨ <b>L E A K O S I N T   R E S U L T</b> ✨🔍",
         "═══════════════════════════════════════",
-        f"🗂️  Databases  ➜  🟢 <b>{len(real_dbs)}</b>",
-        f"📄  Records    ➜  🟡 <b>{total_records}</b>",
-        f"⚡  Status     ➜  ✅ <b>Success</b>",
+        f"🗂️  Databases  ➜  🟢 {len(real_dbs)}",
+        f"📄  Records    ➜  🟡 {total_records}",
+        f"⚡  Status     ➜  ✅ Success",
     ]
     if total_records > DOWNLOAD_THRESHOLD:
-        lines.append(f"📦  Report     ➜  🟠 <b>HTML ready below</b>")
+        lines.append(f"📦  Report     ➜  🟠 HTML ready below")
     lines.append("═══════════════════════════════════════")
 
     for db_index, db_name in enumerate(real_dbs, start=1):
@@ -1678,15 +1689,15 @@ def _format_leakosint_data(data):
 
         lines.append("")
         lines.append("┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓")
-        lines.append(f"┃  🗂️ [ {db_index} / {len(real_dbs)} ]  {_html_escape(db_name.upper())}")
+        lines.append(f"┃  🗂️ [ {db_index} / {len(real_dbs)} ]  {db_name.upper()}")
         lines.append("┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛")
-        lines.append(f"📊 Records: 🔢 <b>{len(records)}</b>  ·  💾 Status: 🟢 Active")
+        lines.append(f"📊 Records: 🔢 {len(records)}  ·  💾 Status: 🟢 Active")
 
         if info_leak:
-            lines.append(f"\n📝 ℹ️ <i>{_html_escape(_truncate(info_leak, 200))}</i>")
+            lines.append(f"\n📝 ℹ️ {_truncate(info_leak, 200)}")
 
         if not records:
-            lines.append("\n📭 <i>(no records in this database)</i>")
+            lines.append("\n📭 (no records in this database)")
             continue
 
         compact_this_db = len(records) > PREVIEW_PER_DB and total_records > DOWNLOAD_THRESHOLD
@@ -1694,7 +1705,7 @@ def _format_leakosint_data(data):
 
         for r_index, record in enumerate(records[:show_count], start=1):
             if not isinstance(record, dict):
-                lines.append(f"\n📄 <code>{_html_escape(_truncate(record))}</code>")
+                lines.append(f"\n📄 {_truncate(record)}")
                 continue
 
             clean_items = []
@@ -1709,23 +1720,23 @@ def _format_leakosint_data(data):
             lines.append("└─────────────────────────────────────────┘")
 
             if not clean_items:
-                lines.append("   └ ⚪ <i>empty record</i>")
+                lines.append("   └ ⚪ empty record")
                 continue
 
             for j, (k, v) in enumerate(clean_items):
                 prefix = "├" if j < len(clean_items) - 1 else "└"
                 emoji  = _emoji_for(k)
-                field  = _html_escape(_pretty_field(k))
-                value  = _html_escape(_truncate(v, 200))
-                lines.append(f"   {prefix} {emoji} <b>{field}</b> ➜ <code>{value}</code>")
+                field  = _pretty_field(k)
+                value  = _truncate(v, 200)
+                lines.append(f"   {prefix} {emoji} {field:<16} ➜  {value}")
 
         if compact_this_db:
             hidden = len(records) - show_count
-            lines.append(f"\n📌 <i>… +{hidden} more record(s) hidden — download the HTML report below.</i>")
+            lines.append(f"\n📌 … +{hidden} more record(s) hidden — download the HTML report below.")
 
     lines.append("")
     lines.append("═══════════════════════════════════════")
-    lines.append("💡 ⚡ Powered by ⚡ <b>L E A K O S I N T A P I</b>")
+    lines.append("💡 ⚡ Powered by ⚡ L E A K O S I N T A P I")
     lines.append("═══════════════════════════════════════")
 
     return "\n".join(lines)
@@ -1736,30 +1747,30 @@ def _format_api_data(data, depth=0):
         return _format_leakosint_data(data)
 
     if depth > 4:
-        return f"<code>{_html_escape(str(data))[:200]}</code>"
+        return str(data)[:200]
     if isinstance(data, dict):
         items = list(data.items())
         lines = []
         for i, (k, v) in enumerate(items):
             prefix = "├" if i < len(items) - 1 else "└"
             emoji  = _emoji_for(k)
-            key_str = _html_escape(_pretty_field(k))
+            key_str = _pretty_field(k)
             if isinstance(v, (dict, list)) and v:
-                lines.append(f"{prefix} {emoji} <b>{key_str}</b>\n{_format_api_data(v, depth + 1)}")
+                lines.append(f"{prefix} {emoji} {key_str}\n{_format_api_data(v, depth + 1)}")
             else:
-                lines.append(f"{prefix} {emoji} <b>{key_str}:</b> <code>{_html_escape(str(v))}</code>")
+                lines.append(f"{prefix} {emoji} {key_str:<16} ➜  {str(v)}")
         return "\n".join(lines)
     if isinstance(data, list):
         lines = []
         for i, item in enumerate(data[:20]):
             if isinstance(item, (dict, list)):
-                lines.append(f"<b>▪ Item {i + 1}</b>\n{_format_api_data(item, depth + 1)}")
+                lines.append(f"▪ Item {i + 1}\n{_format_api_data(item, depth + 1)}")
             else:
-                lines.append(f"• <code>{_html_escape(str(item))}</code>")
+                lines.append(f"• {item}")
         if len(data) > 20:
-            lines.append(f"<i>…and {len(data) - 20} more items</i>")
+            lines.append(f"…and {len(data) - 20} more items")
         return "\n".join(lines)
-    return f"<code>{_html_escape(str(data))}</code>"
+    return str(data)
 
 
 def _send_long(chat_id, text, keyboard=None):
@@ -1776,8 +1787,6 @@ def _send_long(chat_id, text, keyboard=None):
 def _send_long_or_file(chat_id, text, keyboard=None):
     """
     Sends long text as an HTML attachment (UTF-8 safe, emoji-friendly).
-    - Short messages  → inline (no file)
-    - Long messages   → preview + styled .html file
     """
     max_len = 3900
     if len(text) <= max_len:
@@ -1788,7 +1797,7 @@ def _send_long_or_file(chat_id, text, keyboard=None):
     send_message(chat_id, text[:max_len])
 
     try:
-        # ── Strip Telegram HTML tags to get plain readable text ──
+        # ── Strip Telegram HTML tags ──
         plain = (text
                  .replace("<b>", "").replace("</b>", "")
                  .replace("<i>", "").replace("</i>", "")
@@ -1801,7 +1810,6 @@ def _send_long_or_file(chat_id, text, keyboard=None):
         import html as _html
         escaped = _html.escape(plain)
 
-        # ── Build UTF-8 HTML file (dark theme, emoji-friendly) ──
         html_doc = (
             "<!DOCTYPE html>\n"
             "<html lang=\"en\">\n"
@@ -3795,7 +3803,6 @@ def main():
     threading.Thread(target=admin_bot_loop, args=(1,), daemon=True).start()
     threading.Thread(target=self_ping_loop, daemon=True).start()
 
-    # ✅ No backslash inside f-string (Python 3.12 safe)
     _premium_summary = ", ".join(
         f"{p['emoji']} {p['label']}=${p['price']}"
         for p in SUBSCRIPTION_PLANS.values()

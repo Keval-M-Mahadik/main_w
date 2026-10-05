@@ -3703,6 +3703,12 @@ def main():
     threading.Thread(target=admin_bot_loop, args=(1,), daemon=True).start()
     threading.Thread(target=self_ping_loop, daemon=True).start()
 
+    # ✅ FIXED: no backslash inside f-string (Python 3.12 syntax error)
+    _premium_summary = ", ".join(
+        f"{p['emoji']} {p['label']}=${p['price']}"
+        for p in SUBSCRIPTION_PLANS.values()
+    )
+
     print("=" * 60)
     print("Bot started · owner:", OWNER_ID or "(unset)")
     print("Support:", SUPPORT_HANDLE)
@@ -3714,7 +3720,7 @@ def main():
     print(f"🎁 Referrals: {TOKEN_CFG['ref_milestone_instant']} refs → "
           f"{TOKEN_CFG['instant_minutes']}min instant · "
           f"{TOKEN_CFG['ref_milestone_regen']} refs → fast regen")
-    print(f"💎 Premium plans: {', '.join(f'{p[\"emoji\"]} {p[\"label\"]}=${p[\"price\"]}' for p in SUBSCRIPTION_PLANS.values())}")
+    print(f"💎 Premium plans: {_premium_summary}")
     print(f"📥 HTML reports: threshold={DOWNLOAD_THRESHOLD} records · TTL={REPORT_TTL}s")
     print(f"🆓 Free-mode token gate: ON · Admins: {len(DYNAMIC_ADMINS)} · "
           f"Banned: {len(BANNED_USERS)}")

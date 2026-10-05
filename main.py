@@ -1399,9 +1399,12 @@ def call_api(url, query):
     print(f"🔍 [API] {url}  ←  query={query!r}")
 
     if url == "https://leakosintapi.com/":
+        # ✅ Strip "+" and spaces — Leakosint rejects some formatted inputs
+        clean_query = query.replace("+", "").replace(" ", "").strip()
+
         payload = {
             "token": LEAKOSINT_API_KEY,
-            "request": query,
+            "request": clean_query,
             "limit": 100,
             "lang": "en",
         }
@@ -1419,7 +1422,17 @@ def call_api(url, query):
         except requests.exceptions.Timeout:
             return {"ok": False, "error": "timeout"}
         except requests.exceptions.HTTPError as e:
-            return {"ok": False, "error": f"HTTP {e.response.status_code}"}
+            # ✅ Show the real API message, not just "HTTP 400"
+            detail = ""
+            try:
+                err_body = e.response.json()
+                detail = (err_body.get("Error code")
+                          or err_body.get("error")
+                          or e.response.text[:150])
+            except Exception:
+                detail = e.response.text[:150] if e.response is not None else "unknown"
+            status = e.response.status_code if e.response is not None else "?"
+            return {"ok": False, "error": f"HTTP {status} — {detail}"}
         except Exception as e:
             return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
@@ -1436,7 +1449,13 @@ def call_api(url, query):
     except requests.exceptions.Timeout:
         return {"ok": False, "error": "timeout"}
     except requests.exceptions.HTTPError as e:
-        return {"ok": False, "error": f"HTTP {e.response.status_code}"}
+        detail = ""
+        try:
+            detail = e.response.text[:150] if e.response is not None else "unknown"
+        except Exception:
+            detail = "unknown"
+        status = e.response.status_code if e.response is not None else "?"
+        return {"ok": False, "error": f"HTTP {status} — {detail}"}
     except requests.exceptions.ConnectionError:
         return {"ok": False, "error": "connection failed"}
     except Exception as e:

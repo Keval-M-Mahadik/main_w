@@ -1755,33 +1755,106 @@ def _send_long(chat_id, text, keyboard=None):
 
 
 def _send_long_or_file(chat_id, text, keyboard=None):
+    """
+    Sends long text as an HTML attachment (UTF-8 safe, emoji-friendly).
+    - Short messages  → inline (no file)
+    - Long messages   → preview + styled .html file
+    """
     max_len = 3900
     if len(text) <= max_len:
         send_message(chat_id, text, keyboard)
         return
 
+    # First chunk inline for quick preview
     send_message(chat_id, text[:max_len])
 
     try:
+        # ── Strip Telegram HTML tags to get plain readable text ──
         plain = (text
                  .replace("<b>", "").replace("</b>", "")
                  .replace("<i>", "").replace("</i>", "")
                  .replace("<code>", "").replace("</code>", "")
-                 .replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">"))
+                 .replace("<pre>", "").replace("</pre>", "")
+                 .replace("&amp;", "&")
+                 .replace("&lt;", "<")
+                 .replace("&gt;", ">"))
 
-        buf = io.BytesIO(plain.encode("utf-8"))
+        import html as _html
+        escaped = _html.escape(plain)
+
+        # ── Build UTF-8 HTML file (dark theme, emoji-friendly) ──
+        html_doc = (
+            "<!DOCTYPE html>\n"
+            "<html lang=\"en\">\n"
+            "<head>\n"
+            "<meta charset=\"UTF-8\">\n"
+            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n"
+            "<title>OSINT Full Result</title>\n"
+            "<style>\n"
+            ":root{--bg:#0d1117;--panel:#161b22;--border:#2a3441;"
+            "--fg:#e6edf3;--dim:#8b98a5;}\n"
+            "*{box-sizing:border-box}\n"
+            "body{margin:0;background:var(--bg);color:var(--fg);"
+            "font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",Roboto,"
+            "\"Noto Color Emoji\",\"Apple Color Emoji\",\"Segoe UI Emoji\",sans-serif;"
+            "padding:24px 16px;line-height:1.6}\n"
+            ".wrap{max-width:900px;margin:0 auto}\n"
+            ".hero{background:linear-gradient(135deg,#1c2330,#161b22);"
+            "border:1px solid var(--border);border-radius:16px;padding:20px;"
+            "margin-bottom:20px}\n"
+            ".hero h1{margin:0 0 6px;font-size:22px;"
+            "background:linear-gradient(90deg,#58a6ff,#bc8cff);"
+            "-webkit-background-clip:text;background-clip:text;"
+            "-webkit-text-fill-color:transparent;color:#58a6ff}\n"
+            ".hero .sub{color:var(--dim);font-size:13px}\n"
+            "pre{background:var(--panel);border:1px solid var(--border);"
+            "border-radius:12px;padding:18px;overflow-x:auto;"
+            "white-space:pre-wrap;word-break:break-word;"
+            "font-family:ui-monospace,\"SF Mono\",Menlo,Consolas,"
+            "\"Noto Color Emoji\",monospace;font-size:13px;"
+            "line-height:1.55;color:var(--fg);margin:0}\n"
+            ".footer{text-align:center;color:var(--dim);font-size:12px;"
+            "padding:20px 0 8px;border-top:1px solid var(--border);"
+            "margin-top:24px}\n"
+            "</style>\n"
+            "</head>\n"
+            "<body><div class=\"wrap\">\n"
+            "<div class=\"hero\">\n"
+            "<h1>\U0001F4C4 OSINT Full Result</h1>\n"
+            "<div class=\"sub\">Complete search output \u00B7 Opens in any browser</div>\n"
+            "</div>\n"
+            "<pre>" + escaped + "</pre>\n"
+            "<div class=\"footer\">\U0001F4A1 Powered by LeakosintAPI "
+            "\u00B7 \U0001F512 Private report</div>\n"
+            "</div></body></html>"
+        )
+
+        buf = io.BytesIO(html_doc.encode("utf-8"))
         url = f"{USER_TG_API}/sendDocument"
-        HTTP.post(url,
-                  data={"chat_id": chat_id,
-                        "caption": "📄 <b>Full result</b>",
-                        "parse_mode": "HTML"},
-                  files={"document": ("leakosint_result.txt", buf, "text/plain")},
-                  timeout=(10, 60))
+        HTTP.post(
+            url,
+            data={
+                "chat_id":    chat_id,
+                "caption":    ("\U0001F4C4 <b>Full result</b>\n"
+                               "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+                               "\U0001F310  <i>Open in your browser</i>\n"
+                               "\U0001F3A8  <i>Dark theme \u00B7 UTF-8 safe</i>"),
+                "parse_mode": "HTML",
+            },
+            files={
+                "document": (
+                    "full_result.html",
+                    buf,
+                    "text/html; charset=utf-8",
+                )
+            },
+            timeout=(10, 60),
+        )
     except Exception as e:
-        print("send full file err:", e)
+        print("send full html file err:", e)
 
     if keyboard is not None:
-        send_message(chat_id, "✅ Finished.", keyboard)
+        send_message(chat_id, "\u2705 Finished.", keyboard)
 
 
 # ============================================================
@@ -2041,7 +2114,7 @@ def process_callback(cb):
                                    "🎨  <i>Dark theme · Mobile friendly</i>"),
                     "parse_mode": "HTML",
                 },
-                files={"document": (rec["title"], buf, "text/html")},
+                files={"document": (rec["title"], buf, "text/html; charset=utf-8")},
                 timeout=(10, 60),
             )
         except Exception as e:
@@ -3703,7 +3776,7 @@ def main():
     threading.Thread(target=admin_bot_loop, args=(1,), daemon=True).start()
     threading.Thread(target=self_ping_loop, daemon=True).start()
 
-    # ✅ FIXED: no backslash inside f-string (Python 3.12 syntax error)
+    # ✅ No backslash inside f-string (Python 3.12 safe)
     _premium_summary = ", ".join(
         f"{p['emoji']} {p['label']}=${p['price']}"
         for p in SUBSCRIPTION_PLANS.values()

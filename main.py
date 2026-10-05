@@ -121,7 +121,6 @@ IMAGES = {
 }
 IMAGE_CACHE = {}
 
-# ── Token system configuration ──
 TOKEN_CFG = {
     "start_balance":     int(_env("TOKEN_START",          "480")),
     "default_max":       int(_env("TOKEN_DEFAULT_MAX",    "480")),
@@ -137,7 +136,6 @@ TOKEN_CFG = {
     "instant_minutes":       int(_env("REF_INSTANT_MIN",  "60")),
 }
 
-# ── Premium API subscription plans ──
 SUBSCRIPTION_PLANS = {
     "weekly": {
         "label":   "Weekly",
@@ -183,9 +181,7 @@ SUBSCRIPTION_PLANS = {
     },
 }
 
-# ── Field-level emoji mapping for pretty output ──
 FIELD_EMOJI = {
-    # Identity
     "name": "👤", "full_name": "👤", "first_name": "👤", "last_name": "👤",
     "fathername": "👨", "mothername": "👩", "nickname": "🏷️",
     "username": "🏷️", "user_id": "🆔", "id": "🆔", "chat_id": "🆔",
@@ -195,34 +191,22 @@ FIELD_EMOJI = {
     "pan": "🆔", "pan_code": "🆔", "aadhaar": "🪪", "aadhar": "🪪",
     "gender": "⚧️", "age": "🎂", "dob": "🎂", "birthdate": "🎂",
     "bday": "🎂", "docnumber": "📋",
-
-    # Location
     "address": "📍", "address2": "📍", "city": "🏙️", "state": "🏛️", "country": "🌍",
     "district": "🗺️", "pincode": "📮", "postal": "📮", "zip": "📮", "postcode": "📮",
     "latitude": "🧭", "longitude": "🧭", "continent": "🌍", "region": "🗺️",
-
-    # Network / IP
     "ip": "🌐", "ipv4": "🌐", "ipv6": "🌐", "isp": "🏢", "org": "🏢",
     "asn": "🏢", "domain": "🔗", "timezone": "🕒", "type": "🏷️",
     "proxy": "🔐", "vpn": "🔐", "tor": "🧅", "hosting": "☁️",
     "success": "✅", "status": "🟢", "error": "❌", "message": "💬",
-
-    # Finance
     "bank": "🏦", "ifsc": "💳", "micr": "🔢", "account": "🏦",
     "branch": "🏢", "upi": "🏦", "rtgs": "✅", "neft": "✅",
     "imps": "✅", "balance": "💰", "amount": "💵",
-
-    # Vehicle
     "vehicle": "🚘", "vehicle_no": "🚘", "maker": "🏢", "model": "🚗",
     "fuel": "⛽", "color": "🎨", "chassis": "📋", "engine": "🔧",
     "reg_date": "📅", "regdate": "📅", "insurance": "📄", "fitness": "✅",
     "financer": "🏦", "owner": "👑", "owner_name": "👑",
-
-    # Telegram
     "premium": "⭐", "bot": "🤖", "verified": "☑️",
     "language": "🌐", "lang": "🌐",
-
-    # Meta
     "carrier": "📡", "delivery": "🚚", "info": "📝",
     "data": "📦", "record": "📄", "list": "🗂️",
 }
@@ -238,7 +222,6 @@ def _emoji_for(key):
     return "▪️"
 
 
-# ── HTML report cache ──
 REPORT_CACHE = {}
 REPORT_TTL   = 3600
 DOWNLOAD_THRESHOLD = 15
@@ -496,7 +479,7 @@ def log_admin(by, action, target=""):
 
 
 # ============================================================
-# 5c. TOKEN SYSTEM PERSISTENCE + LOGIC
+# 5c. TOKEN SYSTEM
 # ============================================================
 def load_tokens():
     global USER_TOKENS, REF_INDEX
@@ -835,7 +818,7 @@ for _p in IMAGES.values():
 
 
 # ============================================================
-# 8. i18n — ALL 32 languages
+# 8. i18n
 # ============================================================
 LANGUAGES = {
     "en": "🇬🇧 English", "hi": "🇮🇳 हिन्दी", "bn": "🇧🇩 বাংলা", "ur": "🇵🇰 اردو",
@@ -1059,7 +1042,6 @@ _TAG_RE = re.compile(r"</?(b|i|u|s|code|pre|a|tg-spoiler|strong|em|ins|strike|de
 
 
 def send_message(chat_id, text, keyboard=None, parse_mode="HTML"):
-    # ── Safety net: if message has too many tags, strip them all ──
     if parse_mode == "HTML" and text.count("<") > 80:
         text = _TAG_RE.sub("", text)
         text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
@@ -1214,7 +1196,7 @@ def leave_admin_chat(chat_id):
 
 
 # ============================================================
-# 11. FORCE-JOIN MEMBERSHIP CHECK
+# 11. FORCE-JOIN
 # ============================================================
 _BOT_ID_CACHE = {"id": None}
 
@@ -1359,6 +1341,37 @@ def subscription_keyboard(lang="en"):
     return {"inline_keyboard": rows}
 
 
+# ── NEW: Result buttons ──
+def result_inline_keyboard(rid):
+    """Buttons shown under every search result."""
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "📥  Download",  "callback_data": f"res:download:{rid}"},
+                {"text": "⚙️  Functions", "callback_data": f"res:functions:{rid}"},
+            ],
+        ]
+    }
+
+
+def result_functions_keyboard(rid):
+    """Sub-menu opened by the ⚙️ Functions button."""
+    return {
+        "inline_keyboard": [
+            [{"text": "📥  Download HTML Report", "callback_data": f"res:download:{rid}"}],
+            [
+                {"text": "🔎  New Search", "callback_data": "user:cancel"},
+                {"text": "🪙  Tokens",     "callback_data": "tok:status"},
+            ],
+            [
+                {"text": "🎁  Refer",      "callback_data": "tok:ref"},
+                {"text": "💬  Support",    "url": SUPPORT_URL},
+            ],
+            [{"text": "🔙  Back", "callback_data": f"res:back:{rid}"}],
+        ]
+    }
+
+
 # ============================================================
 # 13. ADMIN & OWNER KEYBOARDS
 # ============================================================
@@ -1490,14 +1503,34 @@ def _truncate(val, n=180):
 
 
 # ============================================================
-# 14b. HTML REPORT BUILDER (for the download button)
+# 14b. HTML REPORT BUILDER
 # ============================================================
 def _build_html_report(data, query, uid):
     import datetime, html as _html
     now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
     if not isinstance(data, dict) or "List" not in data:
-        return None
+        # Build a simple report for non-leakosint data
+        try:
+            plain = json.dumps(data, indent=2, ensure_ascii=False, default=str)
+        except Exception:
+            plain = str(data)
+        escaped = _html.escape(plain)
+        return (
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+            "<title>OSINT Result</title>"
+            "<style>body{margin:0;background:#0d1117;color:#e6edf3;"
+            "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;"
+            "padding:24px}pre{background:#161b22;border:1px solid #2a3441;border-radius:12px;"
+            "padding:18px;overflow-x:auto;white-space:pre-wrap;word-break:break-word;"
+            "font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;"
+            "line-height:1.55;color:#e6edf3}</style></head>"
+            "<body><h1>📄 OSINT Result</h1>"
+            f"<p style='color:#8b98a5'>🔎 Query: {_html.escape(str(query))} · "
+            f"📅 {_html.escape(now)}</p>"
+            f"<pre>{escaped}</pre></body></html>"
+        )
 
     databases = data["List"]
     real_dbs = [k for k in databases if k != "No results found"]
@@ -1637,7 +1670,7 @@ def _gc_reports():
 
 
 # ============================================================
-# 14c. FORMATTERS — Plain-text (no HTML tags → no raw tag bug)
+# 14c. FORMATTERS — Plain text (no raw tags)
 # ============================================================
 def _format_leakosint_data(data):
     if not isinstance(data, dict):
@@ -1670,7 +1703,6 @@ def _format_leakosint_data(data):
                 "📄 Records found      : 🔢 0\n\n"
                 "💡 Try a different query or format.")
 
-    # Header — only a couple of safe tags
     lines = [
         "🔍✨ <b>L E A K O S I N T   R E S U L T</b> ✨🔍",
         "═══════════════════════════════════════",
@@ -1785,103 +1817,16 @@ def _send_long(chat_id, text, keyboard=None):
 
 
 def _send_long_or_file(chat_id, text, keyboard=None):
-    """
-    Sends long text as an HTML attachment (UTF-8 safe, emoji-friendly).
-    """
     max_len = 3900
     if len(text) <= max_len:
         send_message(chat_id, text, keyboard)
         return
 
-    # First chunk inline for quick preview
     send_message(chat_id, text[:max_len])
 
-    try:
-        # ── Strip Telegram HTML tags ──
-        plain = (text
-                 .replace("<b>", "").replace("</b>", "")
-                 .replace("<i>", "").replace("</i>", "")
-                 .replace("<code>", "").replace("</code>", "")
-                 .replace("<pre>", "").replace("</pre>", "")
-                 .replace("&amp;", "&")
-                 .replace("&lt;", "<")
-                 .replace("&gt;", ">"))
-
-        import html as _html
-        escaped = _html.escape(plain)
-
-        html_doc = (
-            "<!DOCTYPE html>\n"
-            "<html lang=\"en\">\n"
-            "<head>\n"
-            "<meta charset=\"UTF-8\">\n"
-            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n"
-            "<title>OSINT Full Result</title>\n"
-            "<style>\n"
-            ":root{--bg:#0d1117;--panel:#161b22;--border:#2a3441;"
-            "--fg:#e6edf3;--dim:#8b98a5;}\n"
-            "*{box-sizing:border-box}\n"
-            "body{margin:0;background:var(--bg);color:var(--fg);"
-            "font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",Roboto,"
-            "\"Noto Color Emoji\",\"Apple Color Emoji\",\"Segoe UI Emoji\",sans-serif;"
-            "padding:24px 16px;line-height:1.6}\n"
-            ".wrap{max-width:900px;margin:0 auto}\n"
-            ".hero{background:linear-gradient(135deg,#1c2330,#161b22);"
-            "border:1px solid var(--border);border-radius:16px;padding:20px;"
-            "margin-bottom:20px}\n"
-            ".hero h1{margin:0 0 6px;font-size:22px;"
-            "background:linear-gradient(90deg,#58a6ff,#bc8cff);"
-            "-webkit-background-clip:text;background-clip:text;"
-            "-webkit-text-fill-color:transparent;color:#58a6ff}\n"
-            ".hero .sub{color:var(--dim);font-size:13px}\n"
-            "pre{background:var(--panel);border:1px solid var(--border);"
-            "border-radius:12px;padding:18px;overflow-x:auto;"
-            "white-space:pre-wrap;word-break:break-word;"
-            "font-family:ui-monospace,\"SF Mono\",Menlo,Consolas,"
-            "\"Noto Color Emoji\",monospace;font-size:13px;"
-            "line-height:1.55;color:var(--fg);margin:0}\n"
-            ".footer{text-align:center;color:var(--dim);font-size:12px;"
-            "padding:20px 0 8px;border-top:1px solid var(--border);"
-            "margin-top:24px}\n"
-            "</style>\n"
-            "</head>\n"
-            "<body><div class=\"wrap\">\n"
-            "<div class=\"hero\">\n"
-            "<h1>\U0001F4C4 OSINT Full Result</h1>\n"
-            "<div class=\"sub\">Complete search output \u00B7 Opens in any browser</div>\n"
-            "</div>\n"
-            "<pre>" + escaped + "</pre>\n"
-            "<div class=\"footer\">\U0001F4A1 Powered by LeakosintAPI "
-            "\u00B7 \U0001F512 Private report</div>\n"
-            "</div></body></html>"
-        )
-
-        buf = io.BytesIO(html_doc.encode("utf-8"))
-        url = f"{USER_TG_API}/sendDocument"
-        HTTP.post(
-            url,
-            data={
-                "chat_id":    chat_id,
-                "caption":    ("\U0001F4C4 <b>Full result</b>\n"
-                               "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                               "\U0001F310  <i>Open in your browser</i>\n"
-                               "\U0001F3A8  <i>Dark theme \u00B7 UTF-8 safe</i>"),
-                "parse_mode": "HTML",
-            },
-            files={
-                "document": (
-                    "full_result.html",
-                    buf,
-                    "text/html; charset=utf-8",
-                )
-            },
-            timeout=(10, 60),
-        )
-    except Exception as e:
-        print("send full html file err:", e)
-
+    # The keyboard is sent as a separate final message so buttons stay visible
     if keyboard is not None:
-        send_message(chat_id, "\u2705 Finished.", keyboard)
+        send_message(chat_id, "📄 <b>Result ready above</b>", keyboard)
 
 
 # ============================================================
@@ -2119,8 +2064,8 @@ def process_callback(cb):
         )
         return
 
-    # ── FULL HTML REPORT DOWNLOAD ──
-    if data.startswith("report:html:"):
+    # ── RESULT INLINE BUTTONS (Download / Functions) ──
+    if data.startswith("res:download:"):
         rid = data.split(":", 2)[2]
         rec = REPORT_CACHE.get(rid)
         if not rec or rec["uid"] != chat_id:
@@ -2145,8 +2090,31 @@ def process_callback(cb):
                 timeout=(10, 60),
             )
         except Exception as e:
-            print("send html report err:", e)
+            print("send res html err:", e)
             send_message(chat_id, f"❌ Failed to send report: <code>{e}</code>")
+        return
+
+    if data.startswith("res:functions:"):
+        rid = data.split(":", 2)[2]
+        answer_callback(cb_id)
+        send_message(
+            chat_id,
+            "⚙️ <b>F U N C T I O N S</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "🎯 Choose an action:",
+            result_functions_keyboard(rid),
+        )
+        return
+
+    if data.startswith("res:back:"):
+        rid = data.split(":", 2)[2]
+        answer_callback(cb_id)
+        if msg_id:
+            delete_message(chat_id, msg_id)
+        send_message(chat_id,
+                     "📄 <b>Result ready</b>\n"
+                     "━━━━━━━━━━━━━━━━━━━━━━━━━",
+                     result_inline_keyboard(rid))
         return
 
     # ── TOKEN SYSTEM CALLBACKS ──
@@ -2321,24 +2289,18 @@ def _handle_search(chat_id, lang, api_name, query):
         formatted = _format_api_data(body)
         _gc_reports()
 
-        if is_leakosint and total_records > DOWNLOAD_THRESHOLD:
-            rid = _new_report_id(chat_id)
-            REPORT_CACHE[rid] = {
-                "uid":   chat_id,
-                "html":  _build_html_report(body, query, chat_id) or "",
-                "title": f"leakosint_report_{query.replace('+','').replace(' ','_')}.html",
-                "ts":    time.time(),
-            }
-            kb = {
-                "inline_keyboard": [
-                    [{"text": f"📥  Download Full Report  (HTML · {total_records} records)",
-                      "callback_data": f"report:html:{rid}"}],
-                    [{"text": "🔎  New Search", "callback_data": "user:cancel"}],
-                ]
-            }
-            _send_long_or_file(chat_id, formatted, kb)
-        else:
-            _send_long_or_file(chat_id, formatted, main_keyboard(lang))
+        # ✅ Always create a report → Download button always works
+        rid = _new_report_id(chat_id)
+        safe_q = query.replace("+", "").replace(" ", "_").replace("/", "_")[:40]
+        REPORT_CACHE[rid] = {
+            "uid":   chat_id,
+            "html":  _build_html_report(body, query, chat_id) or "",
+            "title": f"report_{safe_q}.html",
+            "ts":    time.time(),
+        }
+
+        # ✅ Show Download + Functions buttons under the result
+        _send_long_or_file(chat_id, formatted, result_inline_keyboard(rid))
 
         if reason != "instant":
             rec = USER_TOKENS.get(chat_id) or {}
@@ -2481,7 +2443,6 @@ def process_update(update):
         _send_feature_menu(chat_id, lang)
         return
 
-    # ── Token & Refer buttons ──
     if text == "/tokens" or is_button(text, "tokens_btn", lang):
         _send_token_panel(chat_id, lang)
         return

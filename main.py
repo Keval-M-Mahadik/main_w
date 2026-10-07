@@ -91,7 +91,7 @@ JOIN_GROUP_URL       = _env("JOIN_GROUP_URL",   "https://t.me/Dark911_osint")
 JOIN_CHANNEL_CHAT_ID = _env("CHANNEL_CHAT_ID", "-1004360588658")
 JOIN_GROUP_CHAT_ID   = _env("GROUP_CHAT_ID",   "-1004344445959")
 
-FORCE_JOIN_ENABLED = _env("FORCE_JOIN_ENABLED", "true").lower() in ("1", "true", "yes")
+FORCE_JOIN_ENABLED = False
 
 ADMIN_PASSWORD = _env("ADMIN_PASSWORD", "mahesh@321")
 OWNER_ID       = _env("OWNER_ID", "6326027750")
